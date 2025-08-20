@@ -64,9 +64,15 @@ def load_data_from_supabase():
 
 @st.cache_data(ttl=300)
 def get_unique_values(column_name):
-    if not st.session_state.schedule_df.empty:
-        return sorted(list(st.session_state.schedule_df[column_name].dropna().unique()))
-    return []
+    # CORRECCIÓN: Se consulta directamente a Supabase para mayor robustez.
+    try:
+        response = supabase.table('cronograma').select(column_name).execute()
+        if response.data:
+            return sorted(list(set(item[column_name] for item in response.data if item[column_name] is not None)))
+        return []
+    except Exception:
+        return []
+
 
 if 'schedule_df' not in st.session_state:
     st.session_state.schedule_df = load_data_from_supabase()
@@ -99,12 +105,13 @@ def check_db_conflicts(new_class, existing_df):
             conflicts.append(f"❌ **Cruce de Profesor:** El profesor **{row['Profesor']}** ya tiene la clase **'{info['Nombre de la clase']}'** ({info['ID']}) programada el **{row['Fecha'].strftime('%Y-%m-%d')}** de {info['Hora de inicio'].strftime('%H:%M')} a {info['Hora de finalizacion'].strftime('%H:%M')}.")
 
         if not row['Simultaneo']:
+            # BUG CORREGIDO: Se usa la sintaxis correcta de Pandas para el filtro booleano.
             student_conflict = day_schedule[
                 (day_schedule['Programa'] == row['Programa']) &
                 (day_schedule['Semestre'] == row['Semestre']) &
                 (day_schedule['Hora de inicio'] < row['Hora de finalizacion']) &
                 (day_schedule['Hora de finalizacion'] > row['Hora de inicio']) &
-                (not day_schedule['Simultaneo'])
+                (day_schedule['Simultaneo'] == False)
             ]
             if not student_conflict.empty:
                 info = student_conflict.iloc[0]
@@ -155,10 +162,10 @@ with st.container(border=True):
         nombre_clase = st.text_input("Nombre de la clase")
         if st.session_state.get('add_new_program_mode', False):
             programa = st.text_input("Nombre del Nuevo Programa", key="new_prog_text")
-            if st.button("Cancelar Programa"): set_add_mode('add_new_program_mode', False)
+            if st.button("Cancelar Programa"): set_add_mode('add_new_program_mode', False); st.rerun()
         else:
-            programa = st.selectbox("Selecciona un Programa", options=get_unique_values('Programa'), key="prog_select")
-            if st.button("➕ Añadir Nuevo Programa"): set_add_mode('add_new_program_mode', True)
+            programa = st.selectbox("Selecciona un Programa", options=programas_list_filter, key="prog_select")
+            if st.button("➕ Añadir Nuevo Programa"): set_add_mode('add_new_program_mode', True); st.rerun()
     with col2:
         semestre = st.number_input("Semestre", min_value=1, step=1, format="%d")
         creditos = st.number_input("Creditos", min_value=1, step=1, format="%d")
@@ -174,19 +181,25 @@ with st.container(border=True):
         if horas_por_sesion > 0:
             num_sesiones_calculado = math.ceil(horas_totales / horas_por_sesion)
             h_col3.metric("Sesiones a generar", num_sesiones_calculado)
-            if h_col3.button("Generar Campos de Sesión"): st.session_state.num_sesiones_a_generar = num_sesiones_calculado
+            if h_col3.button("Generar Campos de Sesión"): st.session_state.num_sesiones_a_generar = num_sesiones_calculado; st.rerun()
     else:
         num_modulos = st.number_input("Número de Módulos", min_value=1, step=1, format="%d", key="num_modulos_input")
-        if st.button("Generar Módulos"): st.session_state.modulos_a_generar = [{'num_sesiones': 1} for _ in range(num_modulos)]
+        if st.button("Generar Módulos"): st.session_state.modulos_a_generar = [{'num_sesiones': 1} for _ in range(num_modulos)]; st.rerun()
 
 with st.form("new_class_form"):
     st.subheader("Paso 3: Detalles de Fechas, Horarios y Profesores")
     sesiones_data = []
+    
+    # OPTIMIZACIÓN: Se reutiliza la lista de profesores ya cargada.
+    opciones_profesor = ["--- Seleccione un profesor ---"] + profesores_list_filter
+
     if st.session_state.tipo_clase == "Regular":
-        if st.session_state.get('add_new_prof_reg_mode', False):
-            profesor_regular = st.text_input("Nombre del Nuevo Profesor", key="new_prof_reg_text_form")
-        else:
-            profesor_regular = st.selectbox("Profesor (para todas las sesiones)", options=get_unique_values('Profesor'), key="prof_reg_select_form")
+        st.markdown("##### Profesor (asignado a todas las sesiones)")
+        prof_col1, prof_col2 = st.columns(2)
+        profesor_nuevo_reg = prof_col1.text_input("Profesor Nuevo", help="Escribe aquí si el profesor no está en la lista.")
+        profesor_existente_reg = prof_col2.selectbox("Profesor Existente", options=opciones_profesor, help="Usa este campo si el profesor ya existe.")
+        profesor_regular = profesor_existente_reg if profesor_existente_reg != "--- Seleccione un profesor ---" else profesor_nuevo_reg
+
         st.markdown("---")
         for i in range(st.session_state.get('num_sesiones_a_generar', 1)):
             st.markdown(f"**Sesión {i + 1}**")
@@ -199,11 +212,12 @@ with st.form("new_class_form"):
         sesion_counter = 1
         for i in range(len(st.session_state.get('modulos_a_generar', []))):
             st.markdown(f"--- \n ### Módulo {i + 1}")
-            if st.session_state.get(f'add_new_prof_mod_mode_{i}', False):
-                profesor_modulo = st.text_input(f"Nuevo Profesor (Módulo {i + 1})", key=f"new_prof_mod_text_form_{i}")
-            else:
-                profesor_modulo = st.selectbox(f"Profesor del Módulo {i + 1}", options=get_unique_values('Profesor'), key=f"prof_mod_select_form_{i}")
-            
+            st.markdown(f"##### Profesor del Módulo {i + 1}")
+            prof_mod_col1, prof_mod_col2 = st.columns(2)
+            profesor_nuevo_mod = prof_mod_col1.text_input(f"Profesor Nuevo (M{i+1})", key=f"prof_nuevo_mod_{i}", help="Escribe aquí si el profesor no está en la lista.")
+            profesor_existente_mod = prof_mod_col2.selectbox(f"Profesor Existente (M{i+1})", options=opciones_profesor, key=f"prof_existente_mod_{i}", help="Usa este campo si el profesor ya existe.")
+            profesor_modulo = profesor_existente_mod if profesor_existente_mod != "--- Seleccione un profesor ---" else profesor_nuevo_mod
+
             num_sesiones_mod = st.number_input(f"Sesiones para Módulo {i + 1}", min_value=1, step=1, format="%d", value=st.session_state.modulos_a_generar[i]['num_sesiones'], key=f"ses_num_mod_form_{i}")
             for j in range(num_sesiones_mod):
                 st.markdown(f"**Sesión {j + 1} del Módulo {i + 1}**")
@@ -220,6 +234,8 @@ if submit_button:
         st.error("Por favor, llena todos los campos de 'Datos Generales' antes de añadir la clase.")
     elif any(s['Hora de finalizacion'] <= s['Hora de inicio'] for s in sesiones_data):
         st.error("Error: La hora de finalización debe ser posterior a la de inicio para todas las sesiones.")
+    elif any(not s['Profesor'] for s in sesiones_data):
+        st.error("Error: Todas las sesiones o módulos deben tener un profesor asignado. Por favor, escribe un nombre nuevo o selecciónalo de la lista.")
     else:
         temp_df = pd.DataFrame(sesiones_data)
         self_conflicts = check_self_overlap(temp_df)
@@ -258,9 +274,12 @@ else:
     if semestre_filtro: filtered_df = filtered_df[filtered_df['Semestre'].isin(semestre_filtro)]
     st.dataframe(format_for_display(filtered_df.sort_values(by="Fecha")), use_container_width=True)
     
+    # BUG CORREGIDO: El botón de descarga completa ahora usa el dataframe sin filtrar.
+    completo_csv = st.session_state.schedule_df.to_csv(index=False).encode('utf-8')
+    filtrado_csv = filtered_df.to_csv(index=False).encode('utf-8')
     col1, col2 = st.columns(2)
-    col1.download_button("📥 Descargar Cronograma Completo (CSV)", filtered_df.to_csv(index=False).encode('utf-8'), 'cronograma_completo.csv', 'text/csv')
-    col2.download_button("📥 Descargar Vista Filtrada (CSV)", filtered_df.to_csv(index=False).encode('utf-8'), 'cronograma_filtrado.csv', 'text/csv')
+    col1.download_button("📥 Descargar Cronograma Completo (CSV)", completo_csv, 'cronograma_completo.csv', 'text/csv')
+    col2.download_button("📥 Descargar Vista Filtrada (CSV)", filtrado_csv, 'cronograma_filtrado.csv', 'text/csv')
     
     st.markdown("---")
     st.header("🗓️ Vista de Calendario")
