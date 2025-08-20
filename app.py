@@ -14,30 +14,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Estilos CSS ---
-st.markdown("""
-<style>
-    .stApp {
-        background-color: #0E1117; color: #FFFFFF;
-    }
-    h1, h2, h3 {
-        color: #D4AF37;
-    }
-    .stButton>button {
-        background-color: #D4AF37; color: #0E1117; border-radius: 8px; border: 2px solid #D4AF37;
-    }
-    .stButton>button:hover {
-        background-color: #FFFFFF; color: #D4AF37;
-    }
-    .stTextInput>div>div>input, .stSelectbox>div>div>select, .stNumberInput>div>div>input, .stDateInput>div>div>input, .stTimeInput>div>div>input {
-        background-color: #262730; color: #FFFFFF;
-    }
-    .stExpander, .stContainer {
-        border: 1px solid #D4AF37; border-radius: 10px; padding: 1rem;
-    }
-</style>
-""", unsafe_allow_html=True)
-
 # --- Conexión a Supabase y Carga de Datos ---
 @st.cache_resource
 def init_connection():
