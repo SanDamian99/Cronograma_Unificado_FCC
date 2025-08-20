@@ -1,10 +1,10 @@
 [theme]
 
 # Color primario para widgets interactivos
-primaryColor="#FF4B4B"
+primaryColor="#060A24"
 
 # Color de fondo principal de la aplicación
-backgroundColor="#FFFFFF"
+backgroundColor="#E3DC1C"
 
 # Color de fondo secundario (usado en barras laterales y algunos contenedores)
 secondaryBackgroundColor="#F0F2F6"
