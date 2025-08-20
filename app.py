@@ -18,30 +18,22 @@ st.set_page_config(
 st.markdown("""
 <style>
     .stApp {
-        background-color: #0E1117; /* Azul oscuro de fondo */
-        color: #FFFFFF; /* Texto blanco */
+        background-color: #0E1117; color: #FFFFFF;
     }
     h1, h2, h3 {
-        color: #D4AF37; /* Dorado para títulos */
-    }
-    .stButton>button {
-        background-color: #D4AF37;
-        color: #0E1117;
-        border-radius: 8px;
-        border: 2px solid #D4AF37;
-    }
-    .stButton>button:hover {
-        background-color: #FFFFFF;
         color: #D4AF37;
     }
+    .stButton>button {
+        background-color: #D4AF37; color: #0E1117; border-radius: 8px; border: 2px solid #D4AF37;
+    }
+    .stButton>button:hover {
+        background-color: #FFFFFF; color: #D4AF37;
+    }
     .stTextInput>div>div>input, .stSelectbox>div>div>select, .stNumberInput>div>div>input, .stDateInput>div>div>input, .stTimeInput>div>div>input {
-        background-color: #262730;
-        color: #FFFFFF;
+        background-color: #262730; color: #FFFFFF;
     }
     .stExpander, .stContainer {
-        border: 1px solid #D4AF37;
-        border-radius: 10px;
-        padding: 1rem;
+        border: 1px solid #D4AF37; border-radius: 10px; padding: 1rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -49,7 +41,6 @@ st.markdown("""
 # --- Conexión a Supabase y Carga de Datos ---
 @st.cache_resource
 def init_connection():
-    """Inicializa la conexión a Supabase usando las credenciales de st.secrets."""
     url = st.secrets["supabase"]["url"]
     key = st.secrets["supabase"]["key"]
     return create_client(url, key)
@@ -58,7 +49,6 @@ supabase: Client = init_connection()
 
 @st.cache_data(ttl=60)
 def load_data_from_supabase():
-    """Carga los datos desde la tabla 'cronograma' en Supabase."""
     response = supabase.table('cronograma').select('*').execute()
     df = pd.DataFrame(response.data)
     if not df.empty:
@@ -69,7 +59,6 @@ def load_data_from_supabase():
 
 @st.cache_data(ttl=300)
 def get_unique_values(column_name):
-    """Obtiene valores únicos de una columna para los selectbox."""
     response = supabase.table('cronograma').select(column_name).execute()
     if response.data:
         return sorted(list(set(item[column_name] for item in response.data)))
@@ -80,7 +69,6 @@ if 'schedule_df' not in st.session_state:
 
 # --- Funciones de Validación ---
 def check_self_overlap(df):
-    """Revisa si las sesiones en un DataFrame se cruzan entre ellas."""
     conflicts = []
     for (idx1, row1), (idx2, row2) in itertools.combinations(df.iterrows(), 2):
         if row1['Fecha'] == row2['Fecha']:
@@ -89,7 +77,6 @@ def check_self_overlap(df):
     return conflicts
 
 def check_db_conflicts(new_class, existing_df):
-    """Revisa conflictos contra la base de datos existente."""
     conflicts = []
     if existing_df.empty:
         return conflicts
@@ -98,7 +85,6 @@ def check_db_conflicts(new_class, existing_df):
         if day_schedule.empty:
             continue
         
-        # Conflicto para el profesor
         prof_conflict = day_schedule[
             (day_schedule['Profesor'] == row['Profesor']) &
             (day_schedule['Hora de inicio'] < row['Hora de finalizacion']) &
@@ -108,7 +94,6 @@ def check_db_conflicts(new_class, existing_df):
             info = prof_conflict.iloc[0]
             conflicts.append(f"❌ **Cruce de Profesor:** El profesor **{row['Profesor']}** ya tiene la clase **'{info['Nombre de la clase']}'** ({info['ID']}) programada el **{row['Fecha'].strftime('%Y-%m-%d')}** de {info['Hora de inicio'].strftime('%H:%M')} a {info['Hora de finalizacion'].strftime('%H:%M')}.")
 
-        # Conflicto para el programa/semestre
         if not row['Simultaneo']:
             student_conflict = day_schedule[
                 (day_schedule['Programa'] == row['Programa']) &
@@ -131,6 +116,9 @@ def format_for_display(df):
         if col in df_display.columns:
             df_display[col] = df_display[col].apply(lambda x: x.strftime('%H:%M') if pd.notnull(x) else '')
     return df_display
+
+def toggle_add_mode(state_key):
+    st.session_state[state_key] = not st.session_state.get(state_key, False)
 
 # --- Inicialización del Estado de la Sesión ---
 if 'num_sesiones_a_generar' not in st.session_state:
@@ -158,12 +146,13 @@ with st.container():
         catalogo = st.text_input("# de Catalogo")
         nombre_clase = st.text_input("Nombre de la clase")
         
-        st.write("Programa")
-        add_new_program = st.checkbox("Añadir nuevo programa", key="new_prog_check")
-        if add_new_program:
+        # Lógica mejorada para añadir programa
+        if st.session_state.get('add_new_program_mode', False):
             programa = st.text_input("Nombre del Nuevo Programa", key="new_prog_text")
+            st.button("Cancelar", on_click=toggle_add_mode, args=('add_new_program_mode',), key="cancel_prog")
         else:
             programa = st.selectbox("Selecciona un Programa", options=programas_list, key="prog_select")
+            st.button("➕ Añadir Nuevo Programa", on_click=toggle_add_mode, args=('add_new_program_mode',), key="add_prog")
 
     with col2:
         semestre = st.number_input("Semestre", min_value=1, step=1, format="%d")
@@ -197,13 +186,13 @@ with st.form("new_class_form"):
     sesiones_data = []
 
     if st.session_state.tipo_clase == "Regular":
-        st.write("Profesor (asignado a todas las sesiones)")
-        add_new_prof_reg = st.checkbox("Añadir nuevo profesor", key="new_prof_reg_check")
-        if add_new_prof_reg:
+        if st.session_state.get('add_new_prof_reg_mode', False):
             profesor_regular = st.text_input("Nombre del Nuevo Profesor", key="new_prof_reg_text")
+            st.button("Cancelar", on_click=toggle_add_mode, args=('add_new_prof_reg_mode',), key="cancel_prof_reg")
         else:
-            profesor_regular = st.selectbox("Selecciona un Profesor", options=profesores_list, key="prof_reg_select")
-        
+            profesor_regular = st.selectbox("Profesor (asignado a todas las sesiones)", options=profesores_list, key="prof_reg_select")
+            st.button("➕ Añadir Nuevo Profesor", on_click=toggle_add_mode, args=('add_new_prof_reg_mode',), key="add_prof_reg")
+
         st.markdown("---")
         for i in range(st.session_state.get('num_sesiones_a_generar', 1)):
             st.markdown(f"**Sesión {i + 1}**")
@@ -211,18 +200,19 @@ with st.form("new_class_form"):
             fecha = s_col1.date_input(f"Fecha", value=date.today(), key=f"reg_date_{i}")
             hora_inicio = s_col2.time_input(f"Inicio", value=time(8, 0), key=f"reg_start_{i}")
             hora_fin = s_col3.time_input(f"Fin", value=time(10, 0), key=f"reg_end_{i}")
-            sesiones_data.append({"profesor": profesor_regular, "modulo": 1, "sesion_num": i + 1, "fecha": fecha, "hora_inicio": hora_inicio, "hora_fin": hora_fin})
+            sesiones_data.append({"Profesor": profesor_regular, "Módulo": 1, "Sesión": i + 1, "Fecha": fecha, "Hora de inicio": hora_inicio, "Hora de finalizacion": hora_fin})
 
     else: # Modular
         sesion_counter = 1
         for i, mod_config in enumerate(st.session_state.get('modulos_a_generar', [])):
             st.markdown(f"--- \n ### Módulo {i + 1}")
-            st.write(f"Profesor del Módulo {i + 1}")
-            add_new_prof_mod = st.checkbox(f"Añadir nuevo profesor para Módulo {i + 1}", key=f"new_prof_mod_check_{i}")
-            if add_new_prof_mod:
-                profesor_modulo = st.text_input(f"Nombre del Nuevo Profesor", key=f"new_prof_mod_text_{i}")
+            
+            if st.session_state.get(f'add_new_prof_mod_mode_{i}', False):
+                profesor_modulo = st.text_input(f"Nombre del Nuevo Profesor (Módulo {i + 1})", key=f"new_prof_mod_text_{i}")
+                st.button("Cancelar", on_click=toggle_add_mode, args=(f'add_new_prof_mod_mode_{i}',), key=f"cancel_prof_mod_{i}")
             else:
-                profesor_modulo = st.selectbox(f"Selecciona un Profesor", options=profesores_list, key=f"prof_mod_select_{i}")
+                profesor_modulo = st.selectbox(f"Profesor del Módulo {i + 1}", options=profesores_list, key=f"prof_mod_select_{i}")
+                st.button(f"➕ Añadir Nuevo Profesor (Módulo {i + 1})", on_click=toggle_add_mode, args=(f'add_new_prof_mod_mode_{i}',), key=f"add_prof_mod_{i}")
 
             num_sesiones_mod = st.number_input(f"Número de sesiones para Módulo {i + 1}", min_value=1, step=1, format="%d", value=mod_config['num_sesiones'], key=f"ses_num_mod_{i}")
             st.session_state.modulos_a_generar[i]['num_sesiones'] = num_sesiones_mod
@@ -233,7 +223,7 @@ with st.form("new_class_form"):
                 fecha = ms_col1.date_input(f"Fecha", value=date.today(), key=f"mod_date_{i}_{j}")
                 hora_inicio = ms_col2.time_input(f"Inicio", value=time(8, 0), key=f"mod_start_{i}_{j}")
                 hora_fin = ms_col3.time_input(f"Fin", value=time(10, 0), key=f"mod_end_{i}_{j}")
-                sesiones_data.append({"profesor": profesor_modulo, "modulo": i + 1, "sesion_num": sesion_counter, "fecha": fecha, "hora_inicio": hora_inicio, "hora_fin": hora_fin})
+                sesiones_data.append({"Profesor": profesor_modulo, "Módulo": i + 1, "Sesión": sesion_counter, "Fecha": fecha, "Hora de inicio": hora_inicio, "Hora de finalizacion": hora_fin})
                 sesion_counter += 1
     
     submit_button = st.form_submit_button("Añadir Clase al Cronograma")
@@ -242,7 +232,7 @@ with st.form("new_class_form"):
 if submit_button:
     if not all([descripcion, catalogo, nombre_clase, programa]):
         st.error("Por favor, llena todos los campos de 'Datos Generales' antes de añadir la clase.")
-    elif any(s['hora_fin'] <= s['hora_inicio'] for s in sesiones_data):
+    elif any(s['Hora de finalizacion'] <= s['Hora de inicio'] for s in sesiones_data):
         st.error("Error: La hora de finalización debe ser posterior a la de inicio para todas las sesiones.")
     else:
         temp_df = pd.DataFrame(sesiones_data)
@@ -256,10 +246,10 @@ if submit_button:
             class_id_base = f"{catalogo}-{nombre_clase.replace(' ', '')[:5]}"
             for s in sesiones_data:
                 records.append({
-                    'ID': f"{class_id_base}-S{s['sesion_num']}", 'Descripción': descripcion, '# de Catalogo': catalogo, 
+                    'ID': f"{class_id_base}-S{s['Sesión']}", 'Descripción': descripcion, '# de Catalogo': catalogo, 
                     'Nombre de la clase': nombre_clase, 'Programa': programa, 'Semestre': int(semestre), 'Creditos': int(creditos),
-                    'Profesor': s['profesor'], 'Simultaneo': simultaneo, 'Módulo': s['modulo'], 'Sesión': s['sesion_num'], 
-                    'Fecha': s['fecha'], 'Hora de inicio': s['hora_inicio'], 'Hora de finalizacion': s['hora_fin']
+                    'Profesor': s['Profesor'], 'Simultaneo': simultaneo, 'Módulo': s['Módulo'], 'Sesión': s['Sesión'], 
+                    'Fecha': s['Fecha'], 'Hora de inicio': s['Hora de inicio'], 'Hora de finalizacion': s['Hora de finalizacion']
                 })
             final_df = pd.DataFrame(records)
             
