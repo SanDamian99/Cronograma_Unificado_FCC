@@ -12,22 +12,42 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Estilos CSS (Sin cambios) ---
+# --- Estilos CSS ---
 st.markdown("""
 <style>
-    /* ... (Tu CSS se mantiene igual) ... */
-    .stApp { background-color: #0E1117; color: #FFFFFF; }
-    h1, h2, h3 { color: #D4AF37; }
-    .stButton>button { background-color: #D4AF37; color: #0E1117; border-radius: 8px; border: 2px solid #D4AF37; }
-    .stButton>button:hover { background-color: #FFFFFF; color: #D4AF37; }
-    .stTextInput>div>div>input, .stSelectbox>div>div>select, .stNumberInput>div>div>input, .stDateInput>div>div>input, .stTimeInput>div>div>input { background-color: #262730; color: #FFFFFF; }
-    .stExpander, .stContainer { border: 1px solid #D4AF37; border-radius: 10px; padding: 1rem; }
+    .stApp {
+        background-color: #0E1117; /* Azul oscuro de fondo */
+        color: #FFFFFF; /* Texto blanco */
+    }
+    h1, h2, h3 {
+        color: #D4AF37; /* Dorado para títulos */
+    }
+    .stButton>button {
+        background-color: #D4AF37;
+        color: #0E1117;
+        border-radius: 8px;
+        border: 2px solid #D4AF37;
+    }
+    .stButton>button:hover {
+        background-color: #FFFFFF;
+        color: #D4AF37;
+    }
+    .stTextInput>div>div>input, .stSelectbox>div>div>select, .stNumberInput>div>div>input, .stDateInput>div>div>input, .stTimeInput>div>div>input {
+        background-color: #262730;
+        color: #FFFFFF;
+    }
+    .stExpander, .stContainer {
+        border: 1px solid #D4AF37;
+        border-radius: 10px;
+        padding: 1rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # --- Conexión a Supabase ---
 @st.cache_resource
 def init_connection():
+    """Inicializa la conexión a Supabase usando las credenciales de st.secrets."""
     url = st.secrets["supabase"]["url"]
     key = st.secrets["supabase"]["key"]
     return create_client(url, key)
@@ -37,6 +57,7 @@ supabase: Client = init_connection()
 # --- Funciones de Base de Datos ---
 @st.cache_data(ttl=60)
 def load_data_from_supabase():
+    """Carga los datos desde la tabla 'cronograma' en Supabase."""
     response = supabase.table('cronograma').select('*').execute()
     df = pd.DataFrame(response.data)
     if not df.empty:
@@ -51,6 +72,7 @@ if 'schedule_df' not in st.session_state:
 
 # --- Funciones Auxiliares ---
 def check_conflicts(new_class, existing_df):
+    """Verifica si una nueva clase genera conflictos en el horario existente."""
     conflicts = []
     if existing_df.empty:
         return conflicts
@@ -71,7 +93,7 @@ def check_conflicts(new_class, existing_df):
             info = prof_conflict.iloc[0]
             conflicts.append(f"❌ **Cruce de Profesor:** {row['Profesor']} ya tiene la clase '{info['Nombre de la clase']}' el {row['Fecha'].strftime('%Y-%m-%d')} de {info['Hora de inicio'].strftime('%H:%M')} a {info['Hora de finalizacion'].strftime('%H:%M')}.")
 
-        # Conflicto para el programa/semestre
+        # Conflicto para el programa/semestre (si no es simultánea)
         if not row['Simultaneo']:
             student_conflict = day_schedule[
                 (day_schedule['Programa'] == row['Programa']) &
@@ -86,6 +108,7 @@ def check_conflicts(new_class, existing_df):
     return conflicts
 
 def format_for_display(df):
+    """Formatea las columnas de fecha y tiempo para una mejor visualización en tablas."""
     df_display = df.copy()
     if 'Fecha' in df_display.columns:
         df_display['Fecha'] = pd.to_datetime(df_display['Fecha']).dt.strftime('%Y-%m-%d')
@@ -99,25 +122,44 @@ st.title("🗓️ Organizador de Cronogramas de Posgrado")
 st.markdown("---")
 
 with st.expander("ℹ️ ¿Cómo funciona esta aplicación?", expanded=True):
-    st.write("...") # Misma explicación que antes
+    st.write("""
+    Esta herramienta está diseñada para la planificación detallada de los horarios de posgrado. La información se guarda de forma segura en una base de datos en la nube.
 
-# --- Barra Lateral: Filtros ---
-# ... (Sin cambios en la lógica de filtros)
+    1.  **Añadir una Clase:** Completa los **Datos Generales** de la materia.
+    2.  **Elegir Tipo:**
+        * **Regular:** Asigna un solo profesor a todas las sesiones de la clase. Luego, define la **fecha y hora** para cada una de las sesiones.
+        * **Modular:** Divide la clase en módulos. Para cada módulo, asigna un profesor y define cuántas sesiones tiene. Luego, especifica la **fecha y hora** de cada sesión dentro de ese módulo.
+    3.  **Validación Automática:** Al añadir, el sistema revisa que no existan cruces de horario para profesores o estudiantes en las fechas específicas.
+    4.  **Gestión y Visualización:** Filtra la información, visualiza el cronograma completo en una tabla o en un calendario interactivo y descarga los datos en formato CSV.
+    """)
+st.markdown("---")
+
+# --- Barra Lateral: Filtros y Opciones ---
+st.sidebar.header("Filtros y Opciones")
+
+if not st.session_state.schedule_df.empty:
+    programas = sorted(st.session_state.schedule_df['Programa'].unique())
+    profesores = sorted(st.session_state.schedule_df['Profesor'].unique())
+    semestres = sorted(st.session_state.schedule_df['Semestre'].unique())
+else:
+    programas, profesores, semestres = [], [], []
+
+programa_filtro = st.sidebar.multiselect("Filtrar por Programa", options=programas)
+profesor_filtro = st.sidebar.multiselect("Filtrar por Profesor", options=profesores)
+semestre_filtro = st.sidebar.multiselect("Filtrar por Semestre", options=semestres)
 
 # --- Formulario para Añadir Clases ---
 st.header("➕ Añadir Nueva Clase")
-
 tipo_clase = st.radio("Tipo de Clase", ["Regular", "Modular"], horizontal=True)
 
 with st.form("new_class_form", clear_on_submit=True):
-    # --- Datos Generales de la Clase ---
     st.subheader("Datos Generales")
     col1, col2 = st.columns(2)
     with col1:
         descripcion = st.text_input("Descripción")
         catalogo = st.text_input("# de Catalogo")
         nombre_clase = st.text_input("Nombre de la clase")
-        programa = st.text_input("Programa")
+        programa = st.text_input("Programa (Ej: Maestría en Psicología Clínica)")
     with col2:
         semestre = st.number_input("Semestre", min_value=1, step=1, format="%d")
         creditos = st.number_input("Creditos", min_value=1, step=1, format="%d")
@@ -129,7 +171,6 @@ with st.form("new_class_form", clear_on_submit=True):
     
     sesiones_data = []
 
-    # --- LÓGICA PARA CLASE REGULAR (UN SOLO PROFESOR) ---
     if tipo_clase == "Regular":
         profesor_regular = st.text_input("Profesor Asignado para todas las sesiones")
         num_sesiones_regular = st.number_input("Número total de sesiones de la clase", min_value=1, step=1, format="%d")
@@ -137,36 +178,36 @@ with st.form("new_class_form", clear_on_submit=True):
         for i in range(num_sesiones_regular):
             st.markdown(f"**Sesión {i+1}**")
             s_col1, s_col2, s_col3 = st.columns(3)
-            fecha = s_col1.date_input(f"Fecha Sesión {i+1}", key=f"reg_date_{i}")
+            fecha = s_col1.date_input(f"Fecha Sesión {i+1}", value=date.today(), key=f"reg_date_{i}")
             hora_inicio = s_col2.time_input(f"Inicio Sesión {i+1}", value=time(8, 0), key=f"reg_start_{i}")
             hora_fin = s_col3.time_input(f"Fin Sesión {i+1}", value=time(10, 0), key=f"reg_end_{i}")
             sesiones_data.append({"profesor": profesor_regular, "modulo": 1, "sesion_num": i+1, "fecha": fecha, "hora_inicio": hora_inicio, "hora_fin": hora_fin})
 
-    # --- LÓGICA PARA CLASE MODULAR (MÚLTIPLES MÓDULOS Y PROFESORES) ---
     else: # Modular
-        num_modulos = st.number_input("Número de Módulos", min_value=1, step=1, format="%d")
+        num_modulos = st.number_input("Número de Módulos", min_value=1, step=1, format="%d", key="num_modulos")
         sesion_counter = 1
         for i in range(num_modulos):
-            with st.container():
-                st.markdown(f"--- \n ### Módulo {i+1}")
-                m_col1, m_col2 = st.columns(2)
-                profesor_modulo = m_col1.text_input(f"Profesor del Módulo {i+1}", key=f"mod_prof_{i}")
-                num_sesiones_modulo = m_col2.number_input(f"Número de sesiones para Módulo {i+1}", min_value=1, step=1, format="%d", key=f"mod_ses_num_{i}")
+            st.markdown(f"--- \n ### Módulo {i+1}")
+            m_col1, m_col2 = st.columns(2)
+            profesor_modulo = m_col1.text_input(f"Profesor del Módulo {i+1}", key=f"mod_prof_{i}")
+            num_sesiones_modulo = m_col2.number_input(f"Número de sesiones para Módulo {i+1}", min_value=1, step=1, format="%d", key=f"mod_ses_num_{i}")
 
-                for j in range(num_sesiones_modulo):
-                    st.markdown(f"**Sesión {j+1} del Módulo {i+1}**")
-                    ms_col1, ms_col2, ms_col3 = st.columns(3)
-                    fecha = ms_col1.date_input(f"Fecha Sesión {j+1} (M{i+1})", key=f"mod_date_{i}_{j}")
-                    hora_inicio = ms_col2.time_input(f"Inicio Sesión {j+1} (M{i+1})", value=time(8, 0), key=f"mod_start_{i}_{j}")
-                    hora_fin = ms_col3.time_input(f"Fin Sesión {j+1} (M{i+1})", value=time(10, 0), key=f"mod_end_{i}_{j}")
-                    sesiones_data.append({"profesor": profesor_modulo, "modulo": i+1, "sesion_num": sesion_counter, "fecha": fecha, "hora_inicio": hora_inicio, "hora_fin": hora_fin})
-                    sesion_counter += 1
+            for j in range(num_sesiones_modulo):
+                st.markdown(f"**Sesión {j+1} del Módulo {i+1}**")
+                ms_col1, ms_col2, ms_col3 = st.columns(3)
+                fecha = ms_col1.date_input(f"Fecha Sesión {j+1} (M{i+1})", value=date.today(), key=f"mod_date_{i}_{j}")
+                hora_inicio = ms_col2.time_input(f"Inicio Sesión {j+1} (M{i+1})", value=time(8, 0), key=f"mod_start_{i}_{j}")
+                hora_fin = ms_col3.time_input(f"Fin Sesión {j+1} (M{i+1})", value=time(10, 0), key=f"mod_end_{i}_{j}")
+                sesiones_data.append({"profesor": profesor_modulo, "modulo": i+1, "sesion_num": sesion_counter, "fecha": fecha, "hora_inicio": hora_inicio, "hora_fin": hora_fin})
+                sesion_counter += 1
     
     submit_button = st.form_submit_button("Añadir Clase al Cronograma")
 
 # --- Lógica de Procesamiento del Formulario ---
 if submit_button:
-    if any(s['hora_fin'] <= s['hora_inicio'] for s in sesiones_data):
+    if not all([descripcion, catalogo, nombre_clase, programa]):
+        st.error("Por favor, llena todos los campos de 'Datos Generales' antes de añadir la clase.")
+    elif any(s['hora_fin'] <= s['hora_inicio'] for s in sesiones_data):
         st.error("Error: La hora de finalización debe ser posterior a la hora de inicio para todas las sesiones.")
     else:
         new_class_records = []
@@ -210,7 +251,6 @@ st.header("📅 Cronograma General de Clases")
 if st.session_state.schedule_df.empty:
     st.info("Aún no se han añadido clases al cronograma.")
 else:
-    # Aplicar filtros
     filtered_df = st.session_state.schedule_df.copy()
     if programa_filtro:
         filtered_df = filtered_df[filtered_df['Programa'].isin(programa_filtro)]
@@ -219,20 +259,24 @@ else:
     if semestre_filtro:
         filtered_df = filtered_df[filtered_df['Semestre'].isin(semestre_filtro)]
     
-    st.dataframe(format_for_display(filtered_df), use_container_width=True)
-    # ... (Botones de descarga sin cambios)
+    st.dataframe(format_for_display(filtered_df.sort_values(by="Fecha")), use_container_width=True)
+    
+    csv_completo = st.session_state.schedule_df.to_csv(index=False).encode('utf-8')
+    csv_filtrado = filtered_df.to_csv(index=False).encode('utf-8')
+    col_desc1, col_desc2 = st.columns(2)
+    col_desc1.download_button("📥 Descargar Cronograma Completo (CSV)", csv_completo, 'cronograma_completo.csv', 'text/csv')
+    col_desc2.download_button("📥 Descargar Vista Filtrada (CSV)", csv_filtrado, 'cronograma_filtrado.csv', 'text/csv')
 
-    # --- Visualización en Calendario (Mejorada) ---
+    # --- Visualización en Calendario ---
     st.markdown("---")
     st.header("🗓️ Vista de Calendario")
     if not filtered_df.empty:
         calendar_df = filtered_df.copy()
-        # Crear columnas de datetime para el inicio y fin
         calendar_df['start'] = calendar_df.apply(lambda row: pd.to_datetime(f"{row['Fecha']} {row['Hora de inicio']}"), axis=1)
         calendar_df['end'] = calendar_df.apply(lambda row: pd.to_datetime(f"{row['Fecha']} {row['Hora de finalizacion']}"), axis=1)
         
         fig = px.timeline(
-            calendar_df, x_start="start", x_end="end", y="Programa",
+            calendar_df.sort_values(by="start"), x_start="start", x_end="end", y="Programa",
             color="Profesor", text="Nombre de la clase", 
             hover_data=['ID', 'Semestre', 'Módulo', 'Fecha'],
             title="Cronograma de Clases por Programa y Profesor"
@@ -246,5 +290,24 @@ else:
     else:
         st.warning("No hay datos para mostrar en el calendario con los filtros actuales.")
 
-# --- Sección para Eliminar Clases (Sin cambios en la lógica) ---
-# ...
+# --- Sección para Eliminar Clases ---
+st.markdown("---")
+st.header("🗑️ Eliminar Clase del Cronograma")
+
+if not st.session_state.schedule_df.empty:
+    with st.form("delete_form"):
+        unique_class_ids = st.session_state.schedule_df['ID'].str.split('-S').str[0].unique()
+        id_to_delete_base = st.selectbox("Selecciona el ID de la clase a eliminar", options=sorted(unique_class_ids))
+        delete_button = st.form_submit_button("Eliminar Clase")
+
+        if delete_button and id_to_delete_base:
+            try:
+                supabase.table('cronograma').delete().like('ID', f'{id_to_delete_base}%').execute()
+                st.success(f"La clase '{id_to_delete_base}' y todas sus sesiones han sido eliminadas.")
+                st.cache_data.clear()
+                st.session_state.schedule_df = load_data_from_supabase()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error al eliminar de la base de datos: {e}")
+else:
+    st.info("El cronograma está vacío, no hay clases para eliminar.")
