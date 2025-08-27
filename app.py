@@ -60,18 +60,30 @@ def load_schedule_data():
 
 @st.cache_data(ttl=300)
 def load_s3_csv(bucket_name, file_key):
-    """Carga un archivo CSV desde un bucket S3 de Supabase."""
+    """Carga un archivo CSV desde un bucket S3 de Supabase, manejando múltiples codificaciones."""
     try:
         response = s3.get_object(Bucket=bucket_name, Key=file_key)
-        csv_data = response['Body'].read().decode('utf-8')
+        # Lee el contenido del archivo en bytes
+        csv_bytes = response['Body'].read()
+        
+        # Intenta decodificar como UTF-8
+        try:
+            csv_data = csv_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            # Si UTF-8 falla, intenta con latin-1 que es común para archivos en español
+            st.warning(f"El archivo '{file_key}' no es UTF-8. Intentando con codificación 'latin-1'.")
+            csv_data = csv_bytes.decode('latin-1')
+            
         return pd.read_csv(StringIO(csv_data))
+        
     except Exception as e:
-        st.error(f"No se pudo cargar el archivo '{file_key}' desde el bucket '{bucket_name}'. Asegúrate de que el archivo exista y las credenciales sean correctas.")
+        # Este error se mostrará si el archivo no se encuentra o si ambas decodificaciones fallan.
+        st.error(f"No se pudo cargar o procesar el archivo '{file_key}' desde S3.")
         st.warning(f"Detalle del error: {e}")
         return pd.DataFrame()
 
 # --- Carga Inicial de Datos Externos ---
-# Carga los datos de los profesores y del currículo desde S3
+# La llamada a la función no cambia, la lógica está encapsulada dentro de ella.
 professors_df = load_s3_csv('Data_Cronograma', 'profesores.csv')
 curriculum_df = load_s3_csv('Data_Cronograma', 'curriculo.csv')
 
