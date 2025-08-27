@@ -1,7 +1,7 @@
 [theme]
 
 # Color primario para widgets interactivos
-primaryColor="#171603"
+primaryColor="#F54927"
 
 # Color de fondo principal de la aplicación
 backgroundColor="#171603"
@@ -10,7 +10,7 @@ backgroundColor="#171603"
 secondaryBackgroundColor="#171603"
 
 # Color principal del texto
-textColor="#31333F"
+textColor="#F54927"
 
 # Color de la fuente (opcional, pero bueno tenerlo)
 font="sans serif"
