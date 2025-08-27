@@ -248,7 +248,7 @@ else:
     if programa_filtro: filtered_df = filtered_df[filtered_df['Programa'].isin(programa_filtro)]
     if profesor_filtro: filtered_df = filtered_df[filtered_df['Profesor'].isin(profesor_filtro)]
     if semestre_filtro: filtered_df = filtered_df[filtered_df['Semestre'].isin(semestre_filtro)]
-    st.dataframe(format_for_display(filtered_df.sort_values(by="Fecha")), use_container_width=True)
+    st.dataframe(format_for_display(filtered_df.sort_values(by="Fecha")), width='stretch')
     
     # BUG CORREGIDO: El botón de descarga completa ahora usa el dataframe sin filtrar.
     completo_csv = st.session_state.schedule_df.to_csv(index=False).encode('utf-8')
@@ -264,7 +264,7 @@ else:
         filtered_df['end'] = filtered_df.apply(lambda row: pd.to_datetime(f"{row['Fecha']} {row['Hora de finalizacion']}"), axis=1)
         fig = px.timeline(filtered_df.sort_values(by="start"), x_start="start", x_end="end", y="Programa", color="Profesor", text="Nombre de la clase", hover_data=['ID', 'Semestre', 'Módulo', 'Fecha'], title="Cronograma de Clases por Programa y Profesor")
         fig.update_layout(xaxis_title="Fecha y Hora", yaxis_title="Programa", plot_bgcolor='#262730', paper_bgcolor='#0E1117', font_color='#FFFFFF', title_font_color='#D4AF37', legend_title_font_color='#D4AF37')
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     else:
         st.warning("No hay datos para mostrar en el calendario con los filtros actuales.")
 
