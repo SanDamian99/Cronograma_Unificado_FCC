@@ -390,7 +390,7 @@ else:
     if st.session_state.profesor_filtro: filtered_df = filtered_df[filtered_df['Profesor'].isin(st.session_state.profesor_filtro)]
     if st.session_state.semestre_filtro: filtered_df = filtered_df[filtered_df['Semestre'].isin(st.session_state.semestre_filtro)]
     
-    st.dataframe(format_for_display(filtered_df.sort_values(by="Fecha")), use_container_width=True)
+    st.dataframe(format_for_display(filtered_df.sort_values(by="Fecha")), width='stretch')
     
     # Botones de descarga
     completo_csv = st.session_state.schedule_df.to_csv(index=False).encode('utf-8')
@@ -423,7 +423,7 @@ else:
             plot_bgcolor='#262730', paper_bgcolor='#0E1117',
             font_color='white', title_font_color='#D4AF37'
         )
-        st.plotly_chart(fig_timeline, use_container_width=True)
+        st.plotly_chart(fig_timeline, width='stretch')
         
         # Diagrama de Gantt
         st.subheader("📊 Diagrama de Gantt por Clase")
@@ -439,7 +439,7 @@ else:
             plot_bgcolor='#262730', paper_bgcolor='#0E1117',
             font_color='white', title_font_color='#D4AF37'
         )
-        st.plotly_chart(fig_gantt, use_container_width=True)
+        st.plotly_chart(fig_gantt, width='stretch')
 
     else:
         st.warning("No hay datos para mostrar en las visualizaciones con los filtros actuales.")
