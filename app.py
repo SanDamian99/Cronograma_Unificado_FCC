@@ -2,11 +2,10 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import time, date, datetime
-import math
 import itertools
 from supabase import create_client, Client
 import boto3
-from io import StringIO
+from io import StringIO, BytesIO
 
 # --- Configuración de la Página ---
 st.set_page_config(
@@ -37,12 +36,120 @@ def init_connection():
         aws_secret_access_key=s3_secret_key,
         region_name=s3_region
     )
-    
     return supabase_db, s3_client
 
 supabase, s3 = init_connection()
 
-# --- Carga de Datos ---
+# --- Utilidades de lectura desde S3 ---
+@st.cache_data(ttl=300)
+def load_s3_csv(bucket_name, file_key):
+    """Carga un archivo CSV desde un bucket S3, manejando múltiples codificaciones."""
+    try:
+        response = s3.get_object(Bucket=bucket_name, Key=file_key)
+        csv_bytes = response['Body'].read()
+        try:
+            csv_data = csv_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            st.warning(f"El archivo '{file_key}' no es UTF-8. Intentando con 'latin-1'.")
+            csv_data = csv_bytes.decode('latin-1')
+        return pd.read_csv(StringIO(csv_data))
+    except Exception as e:
+        st.error(f"No se pudo cargar o procesar el archivo '{file_key}' desde S3.")
+        st.warning(f"Detalle del error: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=300)
+def load_s3_excel(bucket_name, file_key, sheet_name=0):
+    """Carga un Excel (.xlsx) desde un bucket S3."""
+    try:
+        response = s3.get_object(Bucket=bucket_name, Key=file_key)
+        data = response['Body'].read()
+        try:
+            df = pd.read_excel(BytesIO(data), sheet_name=sheet_name)  # usa openpyxl si está instalado
+        except Exception as e:
+            st.error("Error leyendo el Excel. Asegúrate de tener 'openpyxl' instalado en el entorno.")
+            st.warning(f"Detalle: {e}")
+            return pd.DataFrame()
+        return df
+    except Exception as e:
+        st.error(f"No se pudo cargar el Excel '{file_key}' desde S3.")
+        st.warning(f"Detalle del error: {e}")
+        return pd.DataFrame()
+
+# --- Carga Inicial de Datos Externos ---
+professors_df = load_s3_csv('Data_Cronograma', 'profesores.csv')
+raw_curriculum_df = load_s3_excel('Data_Cronograma', 'PROGRAMACION_Postgrado_v1.xlsx')
+
+# --- Normalización del currículo a los nombres esperados por la UI ---
+def parse_time_safe(val):
+    if pd.isna(val):
+        return None
+    # Acepta 'HH:MM', 'HH:MM:SS' o strings con AM/PM
+    try:
+        return pd.to_datetime(str(val)).time()
+    except Exception:
+        try:
+            return pd.to_datetime(str(val), format='%H:%M').time()
+        except Exception:
+            return None
+
+def normalize_curriculum_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    d = df.copy()
+
+    # Fechas y horas
+    if 'F Reunión' in d.columns:
+        # Si ya viene como datetime64[ns], perfecto; si no, parsear
+        if not pd.api.types.is_datetime64_any_dtype(d['F Reunión']):
+            d['F Reunión'] = pd.to_datetime(d['F Reunión'], errors='coerce')
+    else:
+        d['F Reunión'] = pd.NaT
+
+    # Horas de inicio/final
+    d['Hora Inicio'] = d['Hora Inicio'].apply(parse_time_safe) if 'Hora Inicio' in d.columns else None
+    d['Hora Final']  = d['Hora Final'].apply(parse_time_safe)  if 'Hora Final'  in d.columns else None
+
+    # Renombres para la UI/DB
+    rename_map = {
+        'Nombre del curso': 'Nombre de la clase',
+        'Catálogo': '# de Catalogo',
+        'No.Creditos': 'Creditos',
+        # Descripción preferimos 'Descripción Materia' si existe
+    }
+    for src, dst in rename_map.items():
+        if src in d.columns:
+            d[dst] = d[src]
+
+    # Descripción
+    if 'Descripción Materia' in d.columns:
+        d['Descripción_UI'] = d['Descripción Materia'].fillna('')
+    elif 'Descripción' in d.columns:
+        d['Descripción_UI'] = d['Descripción'].fillna('')
+    else:
+        d['Descripción_UI'] = ''
+
+    # Tipos
+    if 'Semestre' in d.columns:
+        d['Semestre'] = pd.to_numeric(d['Semestre'], errors='coerce').astype('Int64').astype('float').fillna(0).astype(int)
+    if 'Creditos' in d.columns:
+        d['Creditos'] = pd.to_numeric(d['Creditos'], errors='coerce').fillna(0).astype(int)
+    if '# de Catalogo' in d.columns:
+        d['# de Catalogo'] = d['# de Catalogo'].astype(str)
+
+    # Programa como string
+    if 'Programa' in d.columns:
+        d['Programa'] = d['Programa'].astype(str)
+
+    # Profesor (opcional en Excel)
+    if 'Nombre profesor' in d.columns:
+        d['Nombre profesor'] = d['Nombre profesor'].fillna('')
+
+    return d
+
+curriculum_df = normalize_curriculum_df(raw_curriculum_df)
+
+# --- Carga de cronograma desde DB ---
 @st.cache_data(ttl=60)
 def load_schedule_data():
     """Carga el cronograma desde la tabla 'cronograma' en Supabase."""
@@ -51,41 +158,12 @@ def load_schedule_data():
         df = pd.DataFrame(response.data)
         if not df.empty:
             df['Fecha'] = pd.to_datetime(df['Fecha']).dt.date
-            df['Hora de inicio'] = pd.to_datetime(df['Hora de inicio'], format='%H:%M:%S').dt.time
-            df['Hora de finalizacion'] = pd.to_datetime(df['Hora de finalizacion'], format='%H:%M:%S').dt.time
+            df['Hora de inicio'] = pd.to_datetime(df['Hora de inicio'], format='%H:%M:%S', errors='coerce').dt.time
+            df['Hora de finalizacion'] = pd.to_datetime(df['Hora de finalizacion'], format='%H:%M:%S', errors='coerce').dt.time
         return df
     except Exception as e:
         st.error(f"Error de conexión con Supabase DB: No se pudo encontrar la tabla 'cronograma'. Detalle: {e}")
         return pd.DataFrame()
-
-@st.cache_data(ttl=300)
-def load_s3_csv(bucket_name, file_key):
-    """Carga un archivo CSV desde un bucket S3 de Supabase, manejando múltiples codificaciones."""
-    try:
-        response = s3.get_object(Bucket=bucket_name, Key=file_key)
-        # Lee el contenido del archivo en bytes
-        csv_bytes = response['Body'].read()
-        
-        # Intenta decodificar como UTF-8
-        try:
-            csv_data = csv_bytes.decode('utf-8')
-        except UnicodeDecodeError:
-            # Si UTF-8 falla, intenta con latin-1 que es común para archivos en español
-            st.warning(f"El archivo '{file_key}' no es UTF-8. Intentando con codificación 'latin-1'.")
-            csv_data = csv_bytes.decode('latin-1')
-            
-        return pd.read_csv(StringIO(csv_data))
-        
-    except Exception as e:
-        # Este error se mostrará si el archivo no se encuentra o si ambas decodificaciones fallan.
-        st.error(f"No se pudo cargar o procesar el archivo '{file_key}' desde S3.")
-        st.warning(f"Detalle del error: {e}")
-        return pd.DataFrame()
-
-# --- Carga Inicial de Datos Externos ---
-# La llamada a la función no cambia, la lógica está encapsulada dentro de ella.
-professors_df = load_s3_csv('Data_Cronograma', 'profesores.csv')
-curriculum_df = load_s3_csv('Data_Cronograma', 'curriculo.csv')
 
 @st.cache_data(ttl=300)
 def get_unique_values_from_db(column_name):
@@ -107,7 +185,7 @@ def check_self_overlap(df):
     conflicts = []
     for (idx1, row1), (idx2, row2) in itertools.combinations(df.iterrows(), 2):
         if row1['Fecha'] == row2['Fecha']:
-            if row1['Hora de inicio'] < row2['Hora de finalizacion'] and row2['Hora de inicio'] < row1['Hora de finalizacion']:
+            if (row1['Hora de inicio'] < row2['Hora de finalizacion']) and (row2['Hora de inicio'] < row1['Hora de finalizacion']):
                 conflicts.append(f"🔥 **Cruce Interno:** La sesión {idx1 + 1} y la sesión {idx2 + 1} se solapan el mismo día ({row1['Fecha']}).")
     return conflicts
 
@@ -120,7 +198,6 @@ def check_db_conflicts(new_class_df, existing_df):
         day_schedule = existing_df[existing_df['Fecha'] == row['Fecha']]
         if day_schedule.empty:
             continue
-        
         # Conflicto de Profesor
         prof_conflict = day_schedule[
             (day_schedule['Profesor'] == row['Profesor']) &
@@ -129,7 +206,10 @@ def check_db_conflicts(new_class_df, existing_df):
         ]
         if not prof_conflict.empty:
             info = prof_conflict.iloc[0]
-            conflicts.append(f"❌ **Cruce de Profesor:** El profesor **{row['Profesor']}** ya tiene la clase **'{info['Nombre de la clase']}'** programada el **{row['Fecha'].strftime('%Y-%m-%d')}** de {info['Hora de inicio'].strftime('%H:%M')} a {info['Hora de finalizacion'].strftime('%H:%M')}.")
+            conflicts.append(
+                f"❌ **Cruce de Profesor:** El profesor **{row['Profesor']}** ya tiene la clase **'{info['Nombre de la clase']}'** "
+                f"el **{row['Fecha'].strftime('%Y-%m-%d')}** de {info['Hora de inicio'].strftime('%H:%M')} a {info['Hora de finalizacion'].strftime('%H:%M')}."
+            )
 
         # Conflicto de Estudiantes (si la clase no permite simultaneidad)
         if not row['Simultaneo']:
@@ -142,7 +222,11 @@ def check_db_conflicts(new_class_df, existing_df):
             ]
             if not student_conflict.empty:
                 info = student_conflict.iloc[0]
-                conflicts.append(f"❌ **Cruce de Estudiantes:** El programa **{row['Programa']}** (Sem. {info['Semestre']}) ya tiene la clase **'{info['Nombre de la clase']}'** programada el **{row['Fecha'].strftime('%Y-%m-%d')}** de {info['Hora de inicio'].strftime('%H:%M')} a {info['Hora de finalizacion'].strftime('%H:%M')}.")
+                conflicts.append(
+                    f"❌ **Cruce de Estudiantes:** El programa **{row['Programa']}** (Sem. {info['Semestre']}) ya tiene la clase "
+                    f"**'{info['Nombre de la clase']}'** el **{row['Fecha'].strftime('%Y-%m-%d')}** de "
+                    f"{info['Hora de inicio'].strftime('%H:%M')} a {info['Hora de finalizacion'].strftime('%H:%M')}."
+                )
     return conflicts
 
 # --- Funciones Auxiliares ---
@@ -159,7 +243,7 @@ def format_for_display(df):
 def get_time_options():
     """Genera una lista de opciones de tiempo en intervalos de 30 minutos."""
     times = []
-    for hour in range(7, 19): # De 7:00 a 18:30
+    for hour in range(7, 19):  # 7:00 a 18:30
         times.append(time(hour, 0))
         times.append(time(hour, 30))
     times.append(time(19, 0))
@@ -167,13 +251,17 @@ def get_time_options():
 
 # --- Inicialización del Estado de la Sesión ---
 if 'page_mode' not in st.session_state:
-    st.session_state.page_mode = 'select' # 'select' o 'create'
+    st.session_state.page_mode = 'select'  # 'select' o 'create'
 if 'selected_course_info' not in st.session_state:
     st.session_state.selected_course_info = {}
 if 'num_sesiones_a_generar' not in st.session_state:
     st.session_state.num_sesiones_a_generar = 1
 if 'modulos_a_generar' not in st.session_state:
     st.session_state.modulos_a_generar = [{'num_sesiones': 1}]
+if 'prefill_sesiones' not in st.session_state:
+    st.session_state.prefill_sesiones = []
+if 'prefill_profesor' not in st.session_state:
+    st.session_state.prefill_profesor = ""
 
 # --- INTERFAZ DE USUARIO (UI) ---
 st.title("🗓️ Organizador de Cronogramas de Posgrado")
@@ -193,10 +281,12 @@ st.header("➕ Añadir Nueva Clase")
 
 with st.container(border=True):
     st.subheader("Paso 0: Selección de Curso")
-    
-    action_type = st.radio("¿Qué deseas hacer?", 
-                           ["Cargar un curso existente", "Crear un nuevo curso (para electivas)"], 
-                           horizontal=True, key="action_type")
+
+    action_type = st.radio(
+        "¿Qué deseas hacer?",
+        ["Cargar un curso existente", "Crear un nuevo curso (para electivas)"],
+        horizontal=True, key="action_type"
+    )
 
     if action_type == "Cargar un curso existente":
         st.session_state.page_mode = 'select'
@@ -204,48 +294,130 @@ with st.container(border=True):
             st.error("El archivo de currículo no está disponible. No se pueden cargar cursos existentes.")
         else:
             sel_col1, sel_col2 = st.columns(2)
-            # Filtrar programas y semestres del currículo
-            programas_curriculo = sorted(curriculum_df['Programa'].unique())
+            # Programas y semestres del currículo
+            programas_curriculo = sorted(curriculum_df['Programa'].dropna().unique())
             selected_program = sel_col1.selectbox("Selecciona el Programa", options=programas_curriculo, index=0)
-            
-            semestres_curriculo = sorted(curriculum_df[curriculum_df['Programa'] == selected_program]['Semestre'].unique())
+
+            semestres_curriculo = sorted(curriculum_df[curriculum_df['Programa'] == selected_program]['Semestre'].dropna().unique())
+            if len(semestres_curriculo) == 0:
+                st.warning("El programa seleccionado no tiene semestres disponibles en el Excel.")
+                semestres_curriculo = [1]
             selected_semester = sel_col2.selectbox("Selecciona el Semestre", options=semestres_curriculo, index=0)
-            
-            # Filtrar clases basadas en programa y semestre
-            available_classes = curriculum_df[
-                (curriculum_df['Programa'] == selected_program) & 
-                (curriculum_df['Semestre'] == selected_semester)
-            ]
-            
-            class_options = available_classes['Nombre de la clase'].tolist()
-            selected_class_name = st.selectbox("Selecciona la Clase", options=class_options)
-            
-            if st.button("Cargar Información del Curso"):
-                course_data = available_classes[available_classes['Nombre de la clase'] == selected_class_name].iloc[0]
-                st.session_state.selected_course_info = course_data.to_dict()
-                st.success(f"Información de '{selected_class_name}' cargada correctamente. Continúa en los siguientes pasos.")
-                # st.rerun() # Opcional, para refrescar la UI si es necesario
+
+            # Filtrado de clases
+            filtered = curriculum_df[
+                (curriculum_df['Programa'] == selected_program) &
+                (curriculum_df['Semestre'] == int(selected_semester))
+            ].copy()
+
+            if filtered.empty:
+                st.warning("No hay filas para el programa/semestre seleccionados.")
+            else:
+                # Opciones únicas por (Nombre, #Catálogo)
+                unique_classes = (
+                    filtered[['Nombre de la clase', '# de Catalogo']]
+                    .dropna()
+                    .drop_duplicates()
+                    .sort_values(by=['Nombre de la clase', '# de Catalogo'])
+                )
+                unique_classes['label'] = unique_classes.apply(
+                    lambda r: f"{r['Nombre de la clase']} (Catálogo {r['# de Catalogo']})", axis=1
+                )
+                class_labels = unique_classes['label'].tolist()
+                selected_label = st.selectbox("Selecciona la Clase", options=class_labels)
+
+                if st.button("Cargar Información del Curso"):
+                    sel_row = unique_classes[unique_classes['label'] == selected_label].iloc[0]
+                    # Todas las filas de ese curso para prefill de sesiones
+                    course_rows = filtered[
+                        (filtered['Nombre de la clase'] == sel_row['Nombre de la clase']) &
+                        (filtered['# de Catalogo'] == sel_row['# de Catalogo'])
+                    ].copy()
+
+                    # Prefill profesor (más frecuente)
+                    prefill_prof = ""
+                    if 'Nombre profesor' in course_rows.columns:
+                        vc = course_rows['Nombre profesor'].replace('', pd.NA).dropna()
+                        if not vc.empty:
+                            prefill_prof = vc.value_counts().idxmax()
+
+                    # Prefill sesiones desde F Reunión, Hora Inicio/Final
+                    sessions = []
+                    course_rows = course_rows.sort_values(by='F Reunión')
+                    for _, r in course_rows.iterrows():
+                        fecha = pd.NaT if pd.isna(r['F Reunión']) else r['F Reunión'].date()
+                        hi = r['Hora Inicio'] if pd.notna(r['Hora Inicio']) else None
+                        hf = r['Hora Final'] if pd.notna(r['Hora Final']) else None
+                        if (hi is not None) and (hf is not None):
+                            dur = datetime.combine(date.today(), hf) - datetime.combine(date.today(), hi)
+                            dur_horas = max(1, int(round(dur.total_seconds() / 3600)))
+                        else:
+                            dur_horas = 2
+                        if pd.isna(fecha):
+                            # Si no hay 'F Reunión', no agregamos la sesión
+                            continue
+                        sessions.append({
+                            "Fecha": fecha,
+                            "Hora de inicio": hi if hi else time(8, 0),
+                            "Hora de finalizacion": hf if hf else time(10, 0),
+                            "Duracion": dur_horas
+                        })
+
+                    # Si no hay filas con 'F Reunión', no prefill sesiones
+                    if len(sessions) == 0:
+                        # Al menos una sesión por defecto
+                        sessions = [{"Fecha": date.today(), "Hora de inicio": time(8, 0), "Hora de finalizacion": time(10, 0), "Duracion": 2}]
+
+                    st.session_state.prefill_sesiones = sessions
+                    st.session_state.num_sesiones_a_generar = len(sessions)
+                    st.session_state.prefill_profesor = prefill_prof
+
+                    st.session_state.selected_course_info = {
+                        'Nombre de la clase': sel_row['Nombre de la clase'],
+                        'Programa': selected_program,
+                        'Descripción': (course_rows['Descripción_UI'].dropna().iloc[0]
+                                        if 'Descripción_UI' in course_rows.columns and not course_rows['Descripción_UI'].dropna().empty
+                                        else 'N/A'),
+                        '# de Catalogo': str(sel_row['# de Catalogo']),
+                        'Semestre': int(selected_semester),
+                        'Creditos': int(course_rows['Creditos'].dropna().iloc[0]) if 'Creditos' in course_rows.columns and not course_rows['Creditos'].dropna().empty else 1,
+                        'Simultaneo': False
+                    }
+                    st.success(f"Información de '{sel_row['Nombre de la clase']}' cargada. Prefill de {len(sessions)} sesión(es).")
     else:
         st.session_state.page_mode = 'create'
-        st.session_state.selected_course_info = {} # Limpiar datos previos
+        st.session_state.selected_course_info = {}
+        st.session_state.prefill_sesiones = []
+        st.session_state.prefill_profesor = ""
         st.info("Estás en modo de creación. Completa los datos en el Paso 1.")
 
 # --- Formulario Principal ---
-# Desactivar los campos si no se ha cargado o se va a crear una clase
 is_disabled = st.session_state.page_mode == 'select' and not st.session_state.selected_course_info
 
 with st.container(border=True):
     st.subheader("Paso 1: Datos Generales")
     col1, col2 = st.columns(2)
     with col1:
-        nombre_clase = st.text_input("Nombre de la clase", value=st.session_state.selected_course_info.get('Nombre de la clase', ''), disabled=is_disabled)
-        programa = st.text_input("Programa", value=st.session_state.selected_course_info.get('Programa', ''), disabled=is_disabled)
-        descripcion = st.text_input("Descripción", value=st.session_state.selected_course_info.get('Descripción', 'N/A'))
+        nombre_clase = st.text_input("Nombre de la clase",
+                                     value=st.session_state.selected_course_info.get('Nombre de la clase', ''),
+                                     disabled=is_disabled)
+        programa = st.text_input("Programa",
+                                 value=st.session_state.selected_course_info.get('Programa', ''),
+                                 disabled=is_disabled)
+        descripcion = st.text_input("Descripción",
+                                    value=st.session_state.selected_course_info.get('Descripción', 'N/A'))
     with col2:
-        catalogo = st.text_input("# de Catalogo", value=st.session_state.selected_course_info.get('# de Catalogo', ''), disabled=is_disabled)
-        semestre = st.number_input("Semestre", min_value=1, step=1, format="%d", value=int(st.session_state.selected_course_info.get('Semestre', 1)), disabled=is_disabled)
-        creditos = st.number_input("Creditos", min_value=1, step=1, format="%d", value=int(st.session_state.selected_course_info.get('Creditos', 1)), disabled=is_disabled)
-        simultaneo = st.checkbox("¿Permite Simultaneidad?", value=st.session_state.selected_course_info.get('Simultaneo', False))
+        catalogo = st.text_input("# de Catalogo",
+                                 value=st.session_state.selected_course_info.get('# de Catalogo', ''),
+                                 disabled=is_disabled)
+        semestre = st.number_input("Semestre", min_value=1, step=1, format="%d",
+                                   value=int(st.session_state.selected_course_info.get('Semestre', 1)),
+                                   disabled=is_disabled)
+        creditos = st.number_input("Creditos", min_value=1, step=1, format="%d",
+                                   value=int(st.session_state.selected_course_info.get('Creditos', 1)),
+                                   disabled=is_disabled)
+        simultaneo = st.checkbox("¿Permite Simultaneidad?",
+                                 value=st.session_state.selected_course_info.get('Simultaneo', False))
 
 with st.container(border=True):
     st.subheader("Paso 2: Configuración de Sesiones y Requerimientos")
@@ -256,11 +428,14 @@ with st.container(border=True):
     req_espacio = req_col2.text_area("Requerimientos específicos del espacio (opcional)", placeholder="Ej: Video beam, tablero, computadores para 30 personas...", disabled=is_disabled)
 
     if tipo_clase == "Regular":
-        num_sesiones_a_generar = st.number_input("Número de Sesiones a generar", min_value=1, step=1, format="%d", key="num_sesiones_a_generar_input", disabled=is_disabled)
+        # Si hay prefill, usamos esa cantidad; si no, permitimos al usuario definir
+        default_ses = st.session_state.get('num_sesiones_a_generar', 1)
+        num_sesiones_a_generar = st.number_input("Número de Sesiones a generar", min_value=1, step=1, format="%d",
+                                                 key="num_sesiones_a_generar_input", value=default_ses, disabled=is_disabled)
         if st.button("Generar Campos de Sesión"):
             st.session_state.num_sesiones_a_generar = num_sesiones_a_generar
             st.rerun()
-    else: # Modular
+    else:  # Modular
         num_modulos = st.number_input("Número de Módulos", min_value=1, step=1, format="%d", key="num_modulos_input", disabled=is_disabled)
         if st.button("Generar Módulos"):
             st.session_state.modulos_a_generar = [{'num_sesiones': 1} for _ in range(num_modulos)]
@@ -270,42 +445,96 @@ with st.container(border=True):
 with st.form("new_class_form"):
     st.subheader("Paso 3: Detalles de Fechas, Horarios y Profesores")
     sesiones_data = []
-    
-    # Preparar lista de profesores desde el archivo S3
+
+    # Lista de profesores desde S3
     opciones_profesor = ["--- Seleccione un profesor ---"]
     prof_contrato_map = {}
     if not professors_df.empty:
-        unique_professors = professors_df.dropna(subset=['Profesor', 'Contrato']).drop_duplicates(subset=['Profesor'])
-        opciones_profesor += sorted(unique_professors['Profesor'].tolist())
-        prof_contrato_map = pd.Series(unique_professors.Contrato.values, index=unique_professors.Profesor).to_dict()
+        # Se esperan columnas: Profesor, Contrato
+        cols_ok = all(c in professors_df.columns for c in ['Profesor', 'Contrato'])
+        if not cols_ok:
+            st.warning("El archivo 'profesores.csv' debe contener columnas 'Profesor' y 'Contrato'.")
+        else:
+            unique_professors = professors_df.dropna(subset=['Profesor']).drop_duplicates(subset=['Profesor'])
+            opciones_profesor += sorted(unique_professors['Profesor'].tolist())
+            prof_contrato_map = pd.Series(unique_professors['Contrato'].values, index=unique_professors['Profesor']).to_dict()
 
-    # Límites de fechas
-    min_date = date(2026, 1, 13)
-    max_date = date(2026, 6, 26)
-    
+    # Límites de fechas desde el Excel (F Reunión)
+    if not curriculum_df.empty and 'F Reunión' in curriculum_df.columns:
+        valid_dates = curriculum_df['F Reunión'].dropna()
+        if not valid_dates.empty:
+            min_date = valid_dates.min().date()
+            max_date = valid_dates.max().date()
+        else:
+            min_date = date.today()
+            max_date = date.today()
+    else:
+        min_date = date.today()
+        max_date = date.today()
+
     if st.session_state.tipo_clase == "Regular":
+        # Prefill profesor si vino del Excel
+        prefill_prof = st.session_state.prefill_profesor
+        default_prof_index = opciones_profesor.index(prefill_prof) if prefill_prof and prefill_prof in opciones_profesor else 0
+
         st.markdown("##### Profesor (asignado a todas las sesiones)")
-        profesor_existente_reg = st.selectbox("Profesor Existente", options=opciones_profesor, help="Selecciona un profesor de la lista.")
+        profesor_existente_reg = st.selectbox("Profesor Existente", options=opciones_profesor, index=default_prof_index, help="Selecciona un profesor de la lista.")
         profesor_regular = profesor_existente_reg if profesor_existente_reg != "--- Seleccione un profesor ---" else ""
         tipo_contrato_regular = prof_contrato_map.get(profesor_regular, "No especificado")
         if profesor_regular:
             st.info(f"Tipo de Contrato: **{tipo_contrato_regular}**")
-        
+
         st.markdown("---")
-        for i in range(st.session_state.get('num_sesiones_a_generar', 1)):
+        time_opts = get_time_options()
+        def _time_index_or_default(t):
+            if isinstance(t, time) and t in time_opts:
+                return time_opts.index(t)
+            # Aproxima a la cuadrícula de 30 min
+            if isinstance(t, time):
+                minutes = t.hour * 60 + t.minute
+                closest = min(range(len(time_opts)), key=lambda i: abs((time_opts[i].hour*60 + time_opts[i].minute) - minutes))
+                return closest
+            return 2  # 8:00
+
+        prefill_ses = st.session_state.prefill_sesiones or []
+        n = st.session_state.get('num_sesiones_a_generar', 1)
+
+        for i in range(n):
             st.markdown(f"**Sesión {i + 1}**")
             s_col1, s_col2, s_col3 = st.columns(3)
-            fecha = s_col1.date_input("Fecha", value=min_date, min_value=min_date, max_value=max_date, key=f"reg_date_{i}")
-            hora_inicio = s_col2.selectbox("Inicio", options=get_time_options(), index=2, format_func=lambda t: t.strftime('%H:%M'), key=f"reg_start_{i}") # 8:00 AM
-            duracion = s_col3.number_input("Duración (horas enteras)", min_value=1, step=1, value=2, key=f"reg_dur_{i}")
-            
-            # Calcular hora de fin y validar
-            hora_fin = (datetime.combine(date.today(), hora_inicio) + pd.Timedelta(hours=duracion)).time()
-            if hora_fin > time(19, 0):
-                st.warning(f"La duración hace que la clase termine después de las 7:00 PM. Ajusta la hora de inicio o la duración.")
 
-            sesiones_data.append({"Profesor": profesor_regular, "Tipo de Contrato": tipo_contrato_regular, "Módulo": 1, "Sesión": i + 1, "Fecha": fecha, "Hora de inicio": hora_inicio, "Hora de finalizacion": hora_fin})
-    else: # Modular
+            # Valores por defecto desde prefill (si existen)
+            if i < len(prefill_ses):
+                p = prefill_ses[i]
+                def_fecha = p.get("Fecha", min_date)
+                def_inicio = p.get("Hora de inicio", time(8, 0))
+                def_dur = p.get("Duracion", 2)
+            else:
+                def_fecha = min_date
+                def_inicio = time(8, 0)
+                def_dur = 2
+
+            fecha = s_col1.date_input("Fecha", value=def_fecha, min_value=min_date, max_value=max_date, key=f"reg_date_{i}")
+            hora_inicio = s_col2.selectbox("Inicio", options=time_opts, index=_time_index_or_default(def_inicio),
+                                           format_func=lambda t: t.strftime('%H:%M'), key=f"reg_start_{i}")
+            duracion = s_col3.number_input("Duración (horas enteras)", min_value=1, step=1, value=int(def_dur), key=f"reg_dur_{i}")
+
+            hora_fin_dt = (datetime.combine(date.today(), hora_inicio) + pd.Timedelta(hours=int(duracion)))
+            hora_fin = hora_fin_dt.time()
+            if hora_fin > time(19, 0):
+                st.warning("La duración hace que la clase termine después de las 7:00 PM.")
+
+            sesiones_data.append({
+                "Profesor": profesor_regular,
+                "Tipo de Contrato": tipo_contrato_regular,
+                "Módulo": 1,
+                "Sesión": i + 1,
+                "Fecha": fecha,
+                "Hora de inicio": hora_inicio,
+                "Hora de finalizacion": hora_fin
+            })
+
+    else:  # Modular (sin cambios funcionales mayores)
         sesion_counter = 1
         for i, mod in enumerate(st.session_state.get('modulos_a_generar', [])):
             st.markdown(f"--- \n ### Módulo {i + 1}")
@@ -328,13 +557,21 @@ with st.form("new_class_form"):
                 if hora_fin > time(19, 0):
                     st.warning(f"La duración hace que la clase termine después de las 7:00 PM.")
 
-                sesiones_data.append({"Profesor": profesor_modulo, "Tipo de Contrato": tipo_contrato_modulo, "Módulo": i + 1, "Sesión": sesion_counter, "Fecha": fecha, "Hora de inicio": hora_inicio, "Hora de finalizacion": hora_fin})
+                sesiones_data.append({
+                    "Profesor": profesor_modulo,
+                    "Tipo de Contrato": tipo_contrato_modulo,
+                    "Módulo": i + 1,
+                    "Sesión": sesion_counter,
+                    "Fecha": fecha,
+                    "Hora de inicio": hora_inicio,
+                    "Hora de finalizacion": hora_fin
+                })
                 sesion_counter += 1
 
     submit_button = st.form_submit_button("Añadir Clase al Cronograma", disabled=is_disabled)
 
+# --- Envío del formulario ---
 if submit_button:
-    # --- Lógica de Envío del Formulario ---
     if not all([descripcion, catalogo, nombre_clase, programa]):
         st.error("Por favor, completa todos los campos de 'Datos Generales' antes de añadir la clase.")
     elif any(s['Hora de finalizacion'] > time(19, 0) for s in sesiones_data):
@@ -346,7 +583,8 @@ if submit_button:
         self_conflicts = check_self_overlap(temp_df)
         if self_conflicts:
             st.error("No se pudo añadir. Se encontraron cruces entre las sesiones que intentas registrar:")
-            for c in self_conflicts: st.warning(c)
+            for c in self_conflicts:
+                st.warning(c)
         else:
             records = [{
                 'ID': f"{catalogo}-{nombre_clase.replace(' ', '')[:5]}-S{s['Sesión']}",
@@ -373,7 +611,8 @@ if submit_button:
             
             if db_conflicts:
                 st.error("No se pudo añadir. Se encontraron conflictos con el cronograma existente:")
-                for c in db_conflicts: st.warning(c)
+                for c in db_conflicts:
+                    st.warning(c)
             else:
                 # Convertir a string para la inserción en Supabase
                 final_df['Fecha'] = final_df['Fecha'].astype(str)
@@ -383,7 +622,7 @@ if submit_button:
                 try:
                     supabase.table('cronograma').insert(final_df.to_dict('records')).execute()
                     st.success(f"¡Clase '{nombre_clase}' añadida exitosamente!")
-                    st.cache_data.clear() # Limpiar caché para recargar los datos
+                    st.cache_data.clear()  # Limpiar caché para recargar los datos
                     st.session_state.schedule_df = load_schedule_data()
                     st.rerun()
                 except Exception as e:
@@ -398,11 +637,14 @@ if st.session_state.schedule_df.empty:
 else:
     # Aplicar filtros
     filtered_df = st.session_state.schedule_df.copy()
-    if st.session_state.programa_filtro: filtered_df = filtered_df[filtered_df['Programa'].isin(st.session_state.programa_filtro)]
-    if st.session_state.profesor_filtro: filtered_df = filtered_df[filtered_df['Profesor'].isin(st.session_state.profesor_filtro)]
-    if st.session_state.semestre_filtro: filtered_df = filtered_df[filtered_df['Semestre'].isin(st.session_state.semestre_filtro)]
+    if st.session_state.programa_filtro:
+        filtered_df = filtered_df[filtered_df['Programa'].isin(st.session_state.programa_filtro)]
+    if st.session_state.profesor_filtro:
+        filtered_df = filtered_df[filtered_df['Profesor'].isin(st.session_state.profesor_filtro)]
+    if st.session_state.semestre_filtro:
+        filtered_df = filtered_df[filtered_df['Semestre'].isin(st.session_state.semestre_filtro)]
     
-    st.dataframe(format_for_display(filtered_df.sort_values(by="Fecha")), width='stretch')
+    st.dataframe(format_for_display(filtered_df.sort_values(by="Fecha")), use_container_width=True)
     
     # Botones de descarga
     completo_csv = st.session_state.schedule_df.to_csv(index=False).encode('utf-8')
@@ -416,16 +658,14 @@ else:
     st.header("📊 Visualizaciones del Cronograma")
 
     if not filtered_df.empty:
-        # Preparar datos para gráficos
         df_for_plot = filtered_df.copy()
         df_for_plot['start'] = df_for_plot.apply(lambda row: pd.to_datetime(f"{row['Fecha']} {row['Hora de inicio']}"), axis=1)
         df_for_plot['end'] = df_for_plot.apply(lambda row: pd.to_datetime(f"{row['Fecha']} {row['Hora de finalizacion']}"), axis=1)
 
-        # Gráfico de Línea de Tiempo (Timeline)
         st.subheader("🗓️ Vista de Calendario (Timeline)")
         fig_timeline = px.timeline(
-            df_for_plot.sort_values(by="start"), 
-            x_start="start", x_end="end", y="Programa", 
+            df_for_plot.sort_values(by="start"),
+            x_start="start", x_end="end", y="Programa",
             color="Profesor", text="Nombre de la clase",
             hover_data=['ID', 'Semestre', 'Módulo', 'Fecha'],
             title="Cronograma de Clases por Programa y Profesor"
@@ -435,9 +675,8 @@ else:
             plot_bgcolor='#262730', paper_bgcolor='#0E1117',
             font_color='white', title_font_color='#D4AF37'
         )
-        st.plotly_chart(fig_timeline, width='stretch')
+        st.plotly_chart(fig_timeline, use_container_width=True)
         
-        # Diagrama de Gantt
         st.subheader("📊 Diagrama de Gantt por Clase")
         fig_gantt = px.timeline(
             df_for_plot.sort_values(by="start"),
@@ -451,8 +690,7 @@ else:
             plot_bgcolor='#262730', paper_bgcolor='#0E1117',
             font_color='white', title_font_color='#D4AF37'
         )
-        st.plotly_chart(fig_gantt, width='stretch')
-
+        st.plotly_chart(fig_gantt, use_container_width=True)
     else:
         st.warning("No hay datos para mostrar en las visualizaciones con los filtros actuales.")
 
@@ -460,19 +698,15 @@ else:
     st.markdown("---")
     st.header("🗑️ Eliminar Clase del Cronograma")
     with st.form("delete_form"):
-        # Usar una combinación de Nombre, Catálogo y Programa para identificar una clase de forma única
         unique_classes = st.session_state.schedule_df[['Nombre de la clase', '# de Catalogo', 'Programa']].drop_duplicates()
-        class_options_delete = [f"{row['Nombre de la clase']} ({row['# de Catalogo']} - {row['Programa']})" for index, row in unique_classes.iterrows()]
+        class_options_delete = [f"{row['Nombre de la clase']} ({row['# de Catalogo']} - {row['Programa']})" for _, row in unique_classes.iterrows()]
         
         class_to_delete_display = st.selectbox("Selecciona la clase a eliminar", options=sorted(class_options_delete))
         
         if st.form_submit_button("Eliminar Clase"):
             if class_to_delete_display:
-                # Extraer el # de Catalogo para identificar la clase a eliminar
                 catalogo_to_delete = class_to_delete_display.split('(')[1].split(' - ')[0]
-                
                 try:
-                    # El ID base se deriva del # de Catalogo. Eliminamos todas las sesiones que coincidan.
                     supabase.table('cronograma').delete().like('ID', f'{catalogo_to_delete}%').execute()
                     st.success(f"La clase con catálogo '{catalogo_to_delete}' ha sido eliminada.")
                     st.cache_data.clear()
