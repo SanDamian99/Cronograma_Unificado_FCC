@@ -65,7 +65,7 @@ def load_s3_excel(bucket_name, file_key, sheet_name=0):
         response = s3.get_object(Bucket=bucket_name, Key=file_key)
         data = response['Body'].read()
         try:
-            df = pd.read_excel(BytesIO(data), sheet_name=sheet_name)  # usa openpyxl si está instalado
+            df = pd.read_excel(BytesIO(data), sheet_name=sheet_name)  # requiere openpyxl
         except Exception as e:
             st.error("Error leyendo el Excel. Asegúrate de tener 'openpyxl' instalado en el entorno.")
             st.warning(f"Detalle: {e}")
@@ -84,7 +84,6 @@ raw_curriculum_df = load_s3_excel('Data_Cronograma', 'PROGRAMACION_Postgrado_v1.
 def parse_time_safe(val):
     if pd.isna(val):
         return None
-    # Acepta 'HH:MM', 'HH:MM:SS' o strings con AM/PM
     try:
         return pd.to_datetime(str(val)).time()
     except Exception:
@@ -100,13 +99,11 @@ def normalize_curriculum_df(df: pd.DataFrame) -> pd.DataFrame:
 
     # Fechas y horas
     if 'F Reunión' in d.columns:
-        # Si ya viene como datetime64[ns], perfecto; si no, parsear
         if not pd.api.types.is_datetime64_any_dtype(d['F Reunión']):
             d['F Reunión'] = pd.to_datetime(d['F Reunión'], errors='coerce')
     else:
         d['F Reunión'] = pd.NaT
 
-    # Horas de inicio/final
     d['Hora Inicio'] = d['Hora Inicio'].apply(parse_time_safe) if 'Hora Inicio' in d.columns else None
     d['Hora Final']  = d['Hora Final'].apply(parse_time_safe)  if 'Hora Final'  in d.columns else None
 
@@ -115,7 +112,6 @@ def normalize_curriculum_df(df: pd.DataFrame) -> pd.DataFrame:
         'Nombre del curso': 'Nombre de la clase',
         'Catálogo': '# de Catalogo',
         'No.Creditos': 'Creditos',
-        # Descripción preferimos 'Descripción Materia' si existe
     }
     for src, dst in rename_map.items():
         if src in d.columns:
@@ -136,18 +132,31 @@ def normalize_curriculum_df(df: pd.DataFrame) -> pd.DataFrame:
         d['Creditos'] = pd.to_numeric(d['Creditos'], errors='coerce').fillna(0).astype(int)
     if '# de Catalogo' in d.columns:
         d['# de Catalogo'] = d['# de Catalogo'].astype(str)
-
-    # Programa como string
     if 'Programa' in d.columns:
         d['Programa'] = d['Programa'].astype(str)
-
-    # Profesor (opcional en Excel)
     if 'Nombre profesor' in d.columns:
         d['Nombre profesor'] = d['Nombre profesor'].fillna('')
 
     return d
 
 curriculum_df = normalize_curriculum_df(raw_curriculum_df)
+
+# --- Catálogo de contratos permitido (desde profesores.csv) ---
+contratos_opciones = []
+if not professors_df.empty and 'Contrato' in professors_df.columns:
+    contratos_opciones = sorted(
+        professors_df['Contrato']
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .unique()
+        .tolist()
+    )
+
+# --- Fechas del semestre (FIJAS) ---
+SEMESTRE_INICIO = date(2026, 1, 13)
+SEMESTRE_FIN    = date(2026, 6, 29)
+min_date, max_date = SEMESTRE_INICIO, SEMESTRE_FIN
 
 # --- Carga de cronograma desde DB ---
 @st.cache_data(ttl=60)
@@ -341,11 +350,22 @@ with st.container(border=True):
                         if not vc.empty:
                             prefill_prof = vc.value_counts().idxmax()
 
-                    # Prefill sesiones desde F Reunión, Hora Inicio/Final
+                    # Prefill contrato (si Excel trae Descripción.2)
+                    prefill_contrato = ""
+                    if 'Descripción.2' in course_rows.columns:
+                        cc = course_rows['Descripción.2'].replace('', pd.NA).dropna()
+                        if not cc.empty:
+                            prefill_contrato = str(cc.value_counts().idxmax()).strip()
+
+                    # Prefill sesiones desde F Reunión, Hora Inicio/Final (acotadas al semestre fijo)
                     sessions = []
                     course_rows = course_rows.sort_values(by='F Reunión')
                     for _, r in course_rows.iterrows():
-                        fecha = pd.NaT if pd.isna(r['F Reunión']) else r['F Reunión'].date()
+                        fecha_raw = None if pd.isna(r['F Reunión']) else r['F Reunión'].date()
+                        if fecha_raw is None:
+                            continue
+                        # Acotar a los límites del semestre
+                        fecha = min(max(fecha_raw, min_date), max_date)
                         hi = r['Hora Inicio'] if pd.notna(r['Hora Inicio']) else None
                         hf = r['Hora Final'] if pd.notna(r['Hora Final']) else None
                         if (hi is not None) and (hf is not None):
@@ -353,9 +373,6 @@ with st.container(border=True):
                             dur_horas = max(1, int(round(dur.total_seconds() / 3600)))
                         else:
                             dur_horas = 2
-                        if pd.isna(fecha):
-                            # Si no hay 'F Reunión', no agregamos la sesión
-                            continue
                         sessions.append({
                             "Fecha": fecha,
                             "Hora de inicio": hi if hi else time(8, 0),
@@ -363,10 +380,23 @@ with st.container(border=True):
                             "Duracion": dur_horas
                         })
 
-                    # Si no hay filas con 'F Reunión', no prefill sesiones
                     if len(sessions) == 0:
-                        # Al menos una sesión por defecto
-                        sessions = [{"Fecha": date.today(), "Hora de inicio": time(8, 0), "Hora de finalizacion": time(10, 0), "Duracion": 2}]
+                        sessions = [{
+                            "Fecha": min_date,
+                            "Hora de inicio": time(8, 0),
+                            "Hora de finalizacion": time(10, 0),
+                            "Duracion": 2
+                        }]
+
+                    # Centro de costo (primero no nulo)
+                    centro_costo_val = None
+                    if 'Centro_costo_programa' in course_rows.columns:
+                        cc_series = course_rows['Centro_costo_programa'].dropna()
+                        if not cc_series.empty:
+                            try:
+                                centro_costo_val = int(cc_series.iloc[0])
+                            except Exception:
+                                centro_costo_val = None
 
                     st.session_state.prefill_sesiones = sessions
                     st.session_state.num_sesiones_a_generar = len(sessions)
@@ -381,7 +411,9 @@ with st.container(border=True):
                         '# de Catalogo': str(sel_row['# de Catalogo']),
                         'Semestre': int(selected_semester),
                         'Creditos': int(course_rows['Creditos'].dropna().iloc[0]) if 'Creditos' in course_rows.columns and not course_rows['Creditos'].dropna().empty else 1,
-                        'Simultaneo': False
+                        'Simultaneo': False,
+                        'Centro_costo_programa': centro_costo_val,
+                        'Contrato_prefill': prefill_contrato
                     }
                     st.success(f"Información de '{sel_row['Nombre de la clase']}' cargada. Prefill de {len(sessions)} sesión(es).")
     else:
@@ -392,51 +424,89 @@ with st.container(border=True):
         st.info("Estás en modo de creación. Completa los datos en el Paso 1.")
 
 # --- Formulario Principal ---
-is_disabled = st.session_state.page_mode == 'select' and not st.session_state.selected_course_info
+readonly_from_excel = st.session_state.page_mode == 'select' and bool(st.session_state.selected_course_info)
+is_disabled_for_empty_select = st.session_state.page_mode == 'select' and not st.session_state.selected_course_info
 
 with st.container(border=True):
     st.subheader("Paso 1: Datos Generales")
+    if readonly_from_excel:
+        st.caption("🔒 Campos bloqueados (Origen: Excel): Programa, Semestre, Créditos y # de Catálogo.")
+
     col1, col2 = st.columns(2)
     with col1:
-        nombre_clase = st.text_input("Nombre de la clase",
-                                     value=st.session_state.selected_course_info.get('Nombre de la clase', ''),
-                                     disabled=is_disabled)
-        programa = st.text_input("Programa",
-                                 value=st.session_state.selected_course_info.get('Programa', ''),
-                                 disabled=is_disabled)
-        descripcion = st.text_input("Descripción",
-                                    value=st.session_state.selected_course_info.get('Descripción', 'N/A'))
+        # Nombre editable (puedes bloquearlo si lo prefieres)
+        nombre_clase = st.text_input(
+            "Nombre de la clase",
+            value=st.session_state.selected_course_info.get('Nombre de la clase', ''),
+            disabled=is_disabled_for_empty_select
+        )
+        programa = st.text_input(
+            "Programa",
+            value=st.session_state.selected_course_info.get('Programa', ''),
+            disabled=readonly_from_excel
+        )
+        descripcion = st.text_input(
+            "Descripción",
+            value=st.session_state.selected_course_info.get('Descripción', 'N/A')
+        )
     with col2:
-        catalogo = st.text_input("# de Catalogo",
-                                 value=st.session_state.selected_course_info.get('# de Catalogo', ''),
-                                 disabled=is_disabled)
-        semestre = st.number_input("Semestre", min_value=1, step=1, format="%d",
-                                   value=int(st.session_state.selected_course_info.get('Semestre', 1)),
-                                   disabled=is_disabled)
-        creditos = st.number_input("Creditos", min_value=1, step=1, format="%d",
-                                   value=int(st.session_state.selected_course_info.get('Creditos', 1)),
-                                   disabled=is_disabled)
-        simultaneo = st.checkbox("¿Permite Simultaneidad?",
-                                 value=st.session_state.selected_course_info.get('Simultaneo', False))
+        catalogo = st.text_input(
+            "# de Catalogo",
+            value=st.session_state.selected_course_info.get('# de Catalogo', ''),
+            disabled=readonly_from_excel
+        )
+        semestre = st.number_input(
+            "Semestre", min_value=1, step=1, format="%d",
+            value=int(st.session_state.selected_course_info.get('Semestre', 1)),
+            disabled=readonly_from_excel
+        )
+        creditos = st.number_input(
+            "Creditos", min_value=1, step=1, format="%d",
+            value=int(st.session_state.selected_course_info.get('Creditos', 1)),
+            disabled=readonly_from_excel
+        )
+        simultaneo = st.checkbox(
+            "¿Permite Simultaneidad?",
+            value=st.session_state.selected_course_info.get('Simultaneo', False)
+        )
+
+# --- Centro de costo (selector basado en Excel, sin crear nuevos) ---
+with st.container(border=True):
+    st.subheader("Centro de Costo y Requerimientos")
+    cc_opts = []
+    if 'Centro_costo_programa' in curriculum_df.columns:
+        try:
+            cc_opts = sorted({int(x) for x in curriculum_df['Centro_costo_programa'].dropna().tolist()})
+        except Exception:
+            # si hay strings, forzamos numéricos válidos
+            cc_opts = sorted({int(float(str(x))) for x in curriculum_df['Centro_costo_programa'].dropna().tolist() if str(x).strip() != ''})
+    cc_default = st.session_state.selected_course_info.get('Centro_costo_programa', None)
+    if cc_default is None and cc_opts:
+        cc_default = cc_opts[0]
+    centro_costo_programa = st.selectbox(
+        "Centro_costo_programa",
+        options=cc_opts if cc_opts else [0],
+        index=(cc_opts.index(cc_default) if cc_opts and cc_default in cc_opts else 0),
+        help="Solo valores existentes en el Excel."
+    )
 
 with st.container(border=True):
     st.subheader("Paso 2: Configuración de Sesiones y Requerimientos")
-    tipo_clase = st.radio("Tipo de Clase", ["Regular", "Modular"], horizontal=True, key="tipo_clase", disabled=is_disabled)
+    tipo_clase = st.radio("Tipo de Clase", ["Regular", "Modular"], horizontal=True, key="tipo_clase", disabled=is_disabled_for_empty_select)
     
     req_col1, req_col2 = st.columns(2)
-    num_estudiantes = req_col1.number_input("Número de estudiantes estimado", min_value=1, step=1, format="%d", value=25, disabled=is_disabled)
-    req_espacio = req_col2.text_area("Requerimientos específicos del espacio (opcional)", placeholder="Ej: Video beam, tablero, computadores para 30 personas...", disabled=is_disabled)
+    num_estudiantes = req_col1.number_input("Número de estudiantes estimado", min_value=1, step=1, format="%d", value=25, disabled=is_disabled_for_empty_select)
+    req_espacio = req_col2.text_area("Requerimientos específicos del espacio (opcional)", placeholder="Ej: Video beam, tablero, computadores para 30 personas...", disabled=is_disabled_for_empty_select)
 
     if tipo_clase == "Regular":
-        # Si hay prefill, usamos esa cantidad; si no, permitimos al usuario definir
         default_ses = st.session_state.get('num_sesiones_a_generar', 1)
         num_sesiones_a_generar = st.number_input("Número de Sesiones a generar", min_value=1, step=1, format="%d",
-                                                 key="num_sesiones_a_generar_input", value=default_ses, disabled=is_disabled)
+                                                 key="num_sesiones_a_generar_input", value=default_ses, disabled=is_disabled_for_empty_select)
         if st.button("Generar Campos de Sesión"):
             st.session_state.num_sesiones_a_generar = num_sesiones_a_generar
             st.rerun()
     else:  # Modular
-        num_modulos = st.number_input("Número de Módulos", min_value=1, step=1, format="%d", key="num_modulos_input", disabled=is_disabled)
+        num_modulos = st.number_input("Número de Módulos", min_value=1, step=1, format="%d", key="num_modulos_input", disabled=is_disabled_for_empty_select)
         if st.button("Generar Módulos"):
             st.session_state.modulos_a_generar = [{'num_sesiones': 1} for _ in range(num_modulos)]
             st.rerun()
@@ -450,46 +520,42 @@ with st.form("new_class_form"):
     opciones_profesor = ["--- Seleccione un profesor ---"]
     prof_contrato_map = {}
     if not professors_df.empty:
-        # Se esperan columnas: Profesor, Contrato
         cols_ok = all(c in professors_df.columns for c in ['Profesor', 'Contrato'])
         if not cols_ok:
             st.warning("El archivo 'profesores.csv' debe contener columnas 'Profesor' y 'Contrato'.")
         else:
             unique_professors = professors_df.dropna(subset=['Profesor']).drop_duplicates(subset=['Profesor'])
-            opciones_profesor += sorted(unique_professors['Profesor'].tolist())
-            prof_contrato_map = pd.Series(unique_professors['Contrato'].values, index=unique_professors['Profesor']).to_dict()
-
-    # Límites de fechas desde el Excel (F Reunión)
-    if not curriculum_df.empty and 'F Reunión' in curriculum_df.columns:
-        valid_dates = curriculum_df['F Reunión'].dropna()
-        if not valid_dates.empty:
-            min_date = valid_dates.min().date()
-            max_date = valid_dates.max().date()
-        else:
-            min_date = date.today()
-            max_date = date.today()
-    else:
-        min_date = date.today()
-        max_date = date.today()
+            opciones_profesor += sorted(unique_professors['Profesor'].astype(str).tolist())
+            prof_contrato_map = pd.Series(unique_professors['Contrato'].astype(str).values, index=unique_professors['Profesor'].astype(str)).to_dict()
 
     if st.session_state.tipo_clase == "Regular":
-        # Prefill profesor si vino del Excel
+        # Prefill profesor y contrato si viene del Excel
         prefill_prof = st.session_state.prefill_profesor
+        prefill_contrato_excel = st.session_state.selected_course_info.get('Contrato_prefill', "")
         default_prof_index = opciones_profesor.index(prefill_prof) if prefill_prof and prefill_prof in opciones_profesor else 0
 
         st.markdown("##### Profesor (asignado a todas las sesiones)")
         profesor_existente_reg = st.selectbox("Profesor Existente", options=opciones_profesor, index=default_prof_index, help="Selecciona un profesor de la lista.")
         profesor_regular = profesor_existente_reg if profesor_existente_reg != "--- Seleccione un profesor ---" else ""
-        tipo_contrato_regular = prof_contrato_map.get(profesor_regular, "No especificado")
-        if profesor_regular:
-            st.info(f"Tipo de Contrato: **{tipo_contrato_regular}**")
+
+        # Determinar contrato por defecto: Excel > mapa por profesor
+        contrato_por_defecto = prefill_contrato_excel.strip() if prefill_contrato_excel else prof_contrato_map.get(profesor_regular, "No especificado")
+        if contratos_opciones and contrato_por_defecto not in contratos_opciones:
+            contrato_por_defecto = contratos_opciones[0]
+        default_contrato_idx = (contratos_opciones.index(contrato_por_defecto) if contratos_opciones and contrato_por_defecto in contratos_opciones else 0)
+
+        contrato_seleccionado = st.selectbox(
+            "Contrato (solo categorías existentes)",
+            options=contratos_opciones if contratos_opciones else ["No especificado"],
+            index=default_contrato_idx if contratos_opciones else 0,
+            help="Edita el contrato, pero solo entre las categorías existentes."
+        )
 
         st.markdown("---")
         time_opts = get_time_options()
         def _time_index_or_default(t):
             if isinstance(t, time) and t in time_opts:
                 return time_opts.index(t)
-            # Aproxima a la cuadrícula de 30 min
             if isinstance(t, time):
                 minutes = t.hour * 60 + t.minute
                 closest = min(range(len(time_opts)), key=lambda i: abs((time_opts[i].hour*60 + time_opts[i].minute) - minutes))
@@ -503,10 +569,11 @@ with st.form("new_class_form"):
             st.markdown(f"**Sesión {i + 1}**")
             s_col1, s_col2, s_col3 = st.columns(3)
 
-            # Valores por defecto desde prefill (si existen)
+            # Valores por defecto desde prefill (acotados al semestre)
             if i < len(prefill_ses):
                 p = prefill_ses[i]
                 def_fecha = p.get("Fecha", min_date)
+                def_fecha = min(max(def_fecha, min_date), max_date)
                 def_inicio = p.get("Hora de inicio", time(8, 0))
                 def_dur = p.get("Duracion", 2)
             else:
@@ -526,7 +593,7 @@ with st.form("new_class_form"):
 
             sesiones_data.append({
                 "Profesor": profesor_regular,
-                "Tipo de Contrato": tipo_contrato_regular,
+                "Tipo de Contrato": contrato_seleccionado,
                 "Módulo": 1,
                 "Sesión": i + 1,
                 "Fecha": fecha,
@@ -534,15 +601,24 @@ with st.form("new_class_form"):
                 "Hora de finalizacion": hora_fin
             })
 
-    else:  # Modular (sin cambios funcionales mayores)
+    else:  # Modular
         sesion_counter = 1
         for i, mod in enumerate(st.session_state.get('modulos_a_generar', [])):
             st.markdown(f"--- \n ### Módulo {i + 1}")
             profesor_existente_mod = st.selectbox(f"Profesor Existente (M{i+1})", options=opciones_profesor, key=f"prof_existente_mod_{i}", help="Selecciona un profesor para este módulo.")
             profesor_modulo = profesor_existente_mod if profesor_existente_mod != "--- Seleccione un profesor ---" else ""
-            tipo_contrato_modulo = prof_contrato_map.get(profesor_modulo, "No especificado")
-            if profesor_modulo:
-                st.info(f"Tipo de Contrato: **{tipo_contrato_modulo}**")
+
+            contrato_por_defecto_mod = st.session_state.selected_course_info.get('Contrato_prefill', "") or prof_contrato_map.get(profesor_modulo, "No especificado")
+            if contratos_opciones and contrato_por_defecto_mod not in contratos_opciones:
+                contrato_por_defecto_mod = contratos_opciones[0]
+            default_contrato_mod_idx = (contratos_opciones.index(contrato_por_defecto_mod) if contratos_opciones else 0)
+
+            contrato_mod_seleccionado = st.selectbox(
+                f"Contrato (M{i+1})",
+                options=contratos_opciones if contratos_opciones else ["No especificado"],
+                index=default_contrato_mod_idx if contratos_opciones else 0,
+                help="Solo categorías existentes para el contrato."
+            )
 
             num_sesiones_mod = st.number_input(f"Sesiones para Módulo {i + 1}", min_value=1, step=1, format="%d", value=mod['num_sesiones'], key=f"ses_num_mod_form_{i}")
             
@@ -559,7 +635,7 @@ with st.form("new_class_form"):
 
                 sesiones_data.append({
                     "Profesor": profesor_modulo,
-                    "Tipo de Contrato": tipo_contrato_modulo,
+                    "Tipo de Contrato": contrato_mod_seleccionado,
                     "Módulo": i + 1,
                     "Sesión": sesion_counter,
                     "Fecha": fecha,
@@ -568,7 +644,7 @@ with st.form("new_class_form"):
                 })
                 sesion_counter += 1
 
-    submit_button = st.form_submit_button("Añadir Clase al Cronograma", disabled=is_disabled)
+    submit_button = st.form_submit_button("Añadir Clase al Cronograma", disabled=is_disabled_for_empty_select)
 
 # --- Envío del formulario ---
 if submit_button:
@@ -599,6 +675,7 @@ if submit_button:
                 'Simultaneo': simultaneo,
                 'Estudiantes Estimados': int(num_estudiantes),
                 'Requerimientos Espacio': req_espacio,
+                'Centro_costo_programa': int(centro_costo_programa),
                 'Módulo': s['Módulo'],
                 'Sesión': s['Sesión'],
                 'Fecha': s['Fecha'],
@@ -644,7 +721,7 @@ else:
     if st.session_state.semestre_filtro:
         filtered_df = filtered_df[filtered_df['Semestre'].isin(st.session_state.semestre_filtro)]
     
-    st.dataframe(format_for_display(filtered_df.sort_values(by="Fecha")), width='stretch')
+    st.dataframe(format_for_display(filtered_df.sort_values(by="Fecha")), use_container_width=True)
     
     # Botones de descarga
     completo_csv = st.session_state.schedule_df.to_csv(index=False).encode('utf-8')
@@ -675,7 +752,7 @@ else:
             plot_bgcolor='#262730', paper_bgcolor='#0E1117',
             font_color='white', title_font_color='#D4AF37'
         )
-        st.plotly_chart(fig_timeline, width='stretch')
+        st.plotly_chart(fig_timeline, use_container_width=True)
         
         st.subheader("📊 Diagrama de Gantt por Clase")
         fig_gantt = px.timeline(
@@ -690,7 +767,7 @@ else:
             plot_bgcolor='#262730', paper_bgcolor='#0E1117',
             font_color='white', title_font_color='#D4AF37'
         )
-        st.plotly_chart(fig_gantt, width='stretch')
+        st.plotly_chart(fig_gantt, use_container_width=True)
     else:
         st.warning("No hay datos para mostrar en las visualizaciones con los filtros actuales.")
 
