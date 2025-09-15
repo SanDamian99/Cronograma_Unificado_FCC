@@ -721,7 +721,7 @@ else:
     if st.session_state.semestre_filtro:
         filtered_df = filtered_df[filtered_df['Semestre'].isin(st.session_state.semestre_filtro)]
     
-    st.dataframe(format_for_display(filtered_df.sort_values(by="Fecha")), use_container_width=True)
+    st.dataframe(format_for_display(filtered_df.sort_values(by="Fecha")), width='stretch')
     
     # Botones de descarga
     completo_csv = st.session_state.schedule_df.to_csv(index=False).encode('utf-8')
@@ -739,20 +739,53 @@ else:
         df_for_plot['start'] = df_for_plot.apply(lambda row: pd.to_datetime(f"{row['Fecha']} {row['Hora de inicio']}"), axis=1)
         df_for_plot['end'] = df_for_plot.apply(lambda row: pd.to_datetime(f"{row['Fecha']} {row['Hora de finalizacion']}"), axis=1)
 
+        # --- 🗓️ Vista de Calendario (Timeline) sin solape de textos ---
         st.subheader("🗓️ Vista de Calendario (Timeline)")
+        
+        dfp = df_for_plot.sort_values(by="start").copy()
+        
+        # Altura dinámica: ~26px por clase (mín. 450px)
+        row_height = 26
         fig_timeline = px.timeline(
-            df_for_plot.sort_values(by="start"),
-            x_start="start", x_end="end", y="Programa",
-            color="Profesor", text="Nombre de la clase",
-            hover_data=['ID', 'Semestre', 'Módulo', 'Fecha'],
-            title="Cronograma de Clases por Programa y Profesor"
+            dfp,
+            x_start="start",
+            x_end="end",
+            y="Nombre de la clase",     # ← cada clase en su propia fila (menos solape)
+            color="Programa",
+            # ¡OJO!: NO ponemos 'text=' para evitar solapes
+            hover_data=['Programa', 'Profesor', 'Semestre', 'Módulo', 'Fecha']
         )
+        
+        # Estilo Gantt y apariencia
+        fig_timeline.update_yaxes(autorange="reversed")  # Gantt-style
+        fig_timeline.update_traces(text=None, cliponaxis=False)
+        
         fig_timeline.update_layout(
-            xaxis_title="Fecha y Hora", yaxis_title="Programa",
-            plot_bgcolor='#262730', paper_bgcolor='#0E1117',
-            font_color='white', title_font_color='#D4AF37'
+            height=max(450, row_height * dfp['Nombre de la clase'].nunique()),
+            xaxis=dict(
+                range=[pd.Timestamp(min_date), pd.Timestamp(max_date) + pd.Timedelta(days=1)],
+                rangeslider=dict(visible=True),
+                tickformat="%d %b"
+            ),
+            bargap=0.15,
+            hovermode="closest",
+            plot_bgcolor='#262730',
+            paper_bgcolor='#0E1117',
+            font_color='white',
+            title_font_color='#D4AF37',
+            margin=dict(l=10, r=10, t=50, b=10)
         )
-        st.plotly_chart(fig_timeline, use_container_width=True)
+        
+        # Hover más claro
+        fig_timeline.update_traces(
+            hovertemplate="<b>%{y}</b><br>" +
+                          "Programa: %{marker.color}<br>" +
+                          "Profesor: %{customdata[0]}<br>" +
+                          "Inicio: %{base|%Y-%m-%d %H:%M}<br>" +
+                          "Fin: %{x|%Y-%m-%d %H:%M}<extra></extra>"
+        )
+        
+        st.plotly_chart(fig_timeline, width='stretch')
         
         st.subheader("📊 Diagrama de Gantt por Clase")
         fig_gantt = px.timeline(
@@ -767,7 +800,7 @@ else:
             plot_bgcolor='#262730', paper_bgcolor='#0E1117',
             font_color='white', title_font_color='#D4AF37'
         )
-        st.plotly_chart(fig_gantt, use_container_width=True)
+        st.plotly_chart(fig_gantt, width='stretch')
     else:
         st.warning("No hay datos para mostrar en las visualizaciones con los filtros actuales.")
 
